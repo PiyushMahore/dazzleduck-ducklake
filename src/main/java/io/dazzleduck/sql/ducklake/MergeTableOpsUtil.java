@@ -85,7 +85,7 @@ public class MergeTableOpsUtil {
      * baseLocation -> /data/log
      * partition -> List.Of('date', applicationid).
      */
-    public List<String> rewriteWithPartitionNoCommit(List<String> inputFiles,
+public List<String> rewriteWithPartitionNoCommit(List<String> inputFiles,
                                                      String baseLocation,
                                                      List<String> partition) throws SQLException, NoSuchMethodException {
         try (Connection conn = ConnectionPool.getConnection()) {

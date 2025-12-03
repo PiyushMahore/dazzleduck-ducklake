@@ -4,6 +4,7 @@ import io.dazzleduck.sql.commons.ConnectionPool;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.File;
 import java.io.IOException;
 import java.nio.file.*;
 import java.sql.Connection;
@@ -77,15 +78,18 @@ public class MergeTableOpsUtilTest {
                     List.of(c.toString(), d.toString()),
                     List.of(a.getFileName().toString(), b.getFileName().toString())
             );
-            // Validate new file exists
-            Long newFileCount = ConnectionPool.collectFirst("SELECT COUNT(*) FROM %s.ducklake_data_file WHERE path LIKE '%%%s%%'".formatted(METADATABASE, c.getFileName()), Long.class);
-            assertEquals(1, newFileCount, "Expected newly created file to be registered");
-            // Old files removed
-            Long oldCount = ConnectionPool.collectFirst("SELECT COUNT(*) FROM %s.ducklake_data_file WHERE path LIKE '%%%s%%' OR path LIKE '%%%s%%'".formatted(METADATABASE, a.getFileName(), b.getFileName()), Long.class);
-            assertEquals(0, oldCount, "Old files must be removed from metadata");
-            // Deleted scheduled
-            Long scheduled = ConnectionPool.collectFirst("SELECT COUNT(*) FROM %s.ducklake_files_scheduled_for_deletion".formatted(METADATABASE), Long.class);
-            assertEquals(2, scheduled, "Expected both files scheduled for deletion");
+            try( var connection = ConnectionPool.getConnection()){
+                // Validate new file exists
+                Long newFileCount = ConnectionPool.collectFirst(connection, "SELECT COUNT(*) FROM %s.ducklake_data_file WHERE path LIKE '%%%s%%'".formatted(METADATABASE, c.getFileName()), Long.class);
+                assertEquals(1, newFileCount, "Expected newly created file to be registered");
+                String oldCountSql = "SELECT COUNT(*) FROM %s.ducklake_data_file WHERE path LIKE '%%%s%%' OR path LIKE '%%%s%%'".formatted(METADATABASE, a.getFileName(), b.getFileName());
+                // Old files removed
+                Long oldCount = ConnectionPool.collectFirst(connection, oldCountSql, Long.class);
+                assertEquals(0, oldCount, "Old files must be removed from metadata");
+                // Deleted scheduled
+                Long scheduled = ConnectionPool.collectFirst(connection, "SELECT COUNT(*) FROM %s.ducklake_files_scheduled_for_deletion".formatted(METADATABASE), Long.class);
+                assertEquals(2, scheduled, "Expected both files scheduled for deletion");
+            }
         }
     }
 
@@ -155,8 +159,11 @@ public class MergeTableOpsUtilTest {
             ConnectionPool.executeBatchInTxn(conn, inserts);
 
             Long tableId = ConnectionPool.collectFirst("SELECT table_id FROM %s.ducklake_table WHERE table_name='%s'".formatted(METADATABASE, tableName), Long.class);
+            
             // Capture original files
-            List<String> originalFiles = (List<String>) ConnectionPool.collectFirstColumn(conn, "SELECT CONCAT('%s\\', path) FROM %s.ducklake_data_file WHERE table_id = %s".formatted(tableDir.toString(), METADATABASE, tableId), String.class);
+        
+            var files = "SELECT CONCAT('%s', '%s', path) FROM %s.ducklake_data_file WHERE table_id = %s".formatted(tableDir.toString(), File.separator, METADATABASE, tableId);
+            List<String> originalFiles = (List<String>) ConnectionPool.collectFirstColumn(conn, files, String.class);
             assertEquals(4, originalFiles.size(), "Expected 4 original parquet files");
 
             Path baseLocation = tableDir.resolve("rewrite");
@@ -210,7 +217,7 @@ public class MergeTableOpsUtilTest {
             ConnectionPool.executeBatchInTxn(conn, inserts);
 
             Long tableId = ConnectionPool.collectFirst("SELECT table_id FROM %s.ducklake_table WHERE table_name='%s'".formatted(METADATABASE, tableName), Long.class);
-            List<String> originalFiles = (List<String>) ConnectionPool.collectFirstColumn(conn, "SELECT CONCAT('%s\\', path) FROM %s.ducklake_data_file WHERE table_id=%s".formatted(tableDir.toString(), METADATABASE, tableId), String.class);
+            List<String> originalFiles = (List<String>) ConnectionPool.collectFirstColumn(conn, "SELECT CONCAT('%s', '%s', path) FROM %s.ducklake_data_file WHERE table_id=%s".formatted(tableDir.toString(), File.separator, METADATABASE, tableId), String.class);
             assertEquals(4, originalFiles.size(), "Expected 4 parquet files");
 
             Path baseLocation = tableDir.resolve("rewrite");

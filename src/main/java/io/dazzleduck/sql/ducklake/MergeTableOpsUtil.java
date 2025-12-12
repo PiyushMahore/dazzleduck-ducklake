@@ -5,6 +5,7 @@ import java.util.Arrays;
 import java.util.List;
 
 import io.dazzleduck.sql.commons.ConnectionPool;
+import io.dazzleduck.sql.commons.FileStatus;
 import io.dazzleduck.sql.commons.ingestion.CopyResult;
 
 import java.sql.Connection;
@@ -24,10 +25,10 @@ public class MergeTableOpsUtil {
     private static final String UPDATE_TABLE_ID =  "UPDATE %s.ducklake_data_file SET table_id = %s WHERE table_id = %s;";
 
     /**
-     *
+     * @param database database of the table
      * @param tableId id of the table
      * @param tempTableId temporary  table id which will be used to calculate the metadata
-     * @param database metadata database
+     * @param mdDatabase metadata database
      * @param toAdd Files to be added
      * @param toRemove Files to be deleted
      *  The function will update metadata table inside a transaction. It will abort if any of the file  in the remove is missing
@@ -41,10 +42,13 @@ public class MergeTableOpsUtil {
      * commit the transaction.
      * open conn --> begin transaction --> execute changes with connectionPool.executeBatch --> commit; close conn.
      */
-    public void replace(long tableId,
+    public static void replace(String database,
+                        long tableId,
                         long tempTableId,
-                        String database, List<String> toAdd, List<String> toRemove) throws SQLException {
-        String mdDatabase = "__ducklake_metadata_" + database;
+                        String mdDatabase,
+                        List<String> toAdd,
+                        List<String> toRemove) throws SQLException {
+
         try (Connection conn = ConnectionPool.getConnection()) {
             String tempTableName = ConnectionPool.collectFirst(conn, GET_TABLE_NAME_BY_ID.formatted(mdDatabase, tempTableId), String.class);
             for (String file : toAdd) {
@@ -88,9 +92,9 @@ public class MergeTableOpsUtil {
      * baseLocation -> /data/log
      * partition -> List.Of('date', applicationid).
      */
-    public List<String> rewriteWithPartitionNoCommit(List<String> inputFiles,
+    public static List<String> rewriteWithPartitionNoCommit(List<String> inputFiles,
                                                      String baseLocation,
-                                                     List<String> partition) throws SQLException, NoSuchMethodException {
+                                                     List<String> partition) throws SQLException {
         try (Connection conn = ConnectionPool.getConnection()) {
             String sources = inputFiles.stream().map(s -> "'" + s + "'").collect(Collectors.joining(","));
             String partitionClause = partition.isEmpty() ? "" : "PARTITION_BY (" + String.join(", ", partition) + "),";
@@ -111,7 +115,13 @@ public class MergeTableOpsUtil {
      * @param filter filter for the files which need to preserved.
      * @return List of the files which are removed. It will not delete the files but update the metadata.
      */
-    public List<String> drop(long tableId, String mdDatabase, String filter){
+    public static List<String> drop(long tableId, String mdDatabase, String filter){
         return null;
+    }
+
+    public static List<FileStatus> listFiles(String database,
+                                             long tableId,
+                                             String mdDatabase, long minSize, long mazSize ) {
+        return List.of();
     }
 }

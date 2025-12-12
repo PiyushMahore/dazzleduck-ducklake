@@ -70,10 +70,11 @@ public class MergeTableOpsUtilTest {
             String ADD_DATA_FILES_QUERY = "CALL ducklake_add_data_files('%s','%s','%s')";
             ConnectionPool.executeBatchInTxn(conn, new String[]{ADD_DATA_FILES_QUERY.formatted(CATALOG, tableName, file1), ADD_DATA_FILES_QUERY.formatted(CATALOG, tableName, file2)});
             // Method under test
-            mergeTableOpsUtil.replace(
+            var database = CATALOG;
+            mergeTableOpsUtil.replace(CATALOG,
                     tableId,
                     tempTableId,
-                    CATALOG,
+                    "__ducklake_metadata_" + database,
                     List.of(file3.toString(), file4.toString()),
                     List.of(file1.getFileName().toString(), file2.getFileName().toString())
             );
@@ -121,13 +122,13 @@ public class MergeTableOpsUtilTest {
             // Register file1 only
             String ADD_DATA_FILES_QUERY = "CALL ducklake_add_data_files('%s','%s','%s')";
             ConnectionPool.executeBatchInTxn(conn, new String[]{ADD_DATA_FILES_QUERY.formatted(CATALOG, tableName, file1)});
-
+            var database = CATALOG;
             IllegalStateException ex = assertThrows(
                     IllegalStateException.class,
-                    () -> mergeTableOpsUtil.replace(
+                    () -> mergeTableOpsUtil.replace( database,
                             tableId,
                             tempTableId,
-                            CATALOG,
+                            "__ducklake_metadata_" + database,
                             List.of(file3.toString()),
                             List.of(file1.getFileName().toString(), "file2 does not exist")
                     )

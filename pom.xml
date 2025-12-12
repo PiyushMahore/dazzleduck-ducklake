@@ -19,8 +19,8 @@
     <dependencies>
         <dependency>
             <groupId>io.dazzleduck.sql</groupId>
-            <artifactId>dazzleduck-sql-flight</artifactId>
-            <version>${dazzleduck.vesion}</version>
+            <artifactId>dazzleduck-sql-commons</artifactId>
+            <version>0.0.13-SNAPSHOT</version>
         </dependency>
 
         <dependency>

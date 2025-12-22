@@ -12,7 +12,6 @@ import io.dazzleduck.sql.commons.ingestion.CopyResult;
 
 import java.sql.Connection;
 import java.sql.SQLException;
-import java.util.UUID;
 import java.util.stream.Collectors;
 
 public class MergeTableOpsUtil {
@@ -133,8 +132,8 @@ public class MergeTableOpsUtil {
         try (Connection conn = ConnectionPool.getConnection()) {
             Path p = Paths.get(inputFile);
             Path fileName = p.getFileName();
-            var tagetPath = baseLocation + fileName.toString();
-            return getStrings("'" + inputFile + "'", tagetPath, partition, conn);
+            var targetPath = baseLocation + fileName.toString();
+            return getStrings("'" + inputFile + "'", targetPath, partition, conn);
         }
     }
 

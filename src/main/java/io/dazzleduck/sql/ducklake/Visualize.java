@@ -15,9 +15,12 @@ import java.util.List;
  * - Adding partition column
  * - Inserting data
  * - Deleting data
+ * - Updating data
+ * - Deleting files with MergeTableOpsUtil.deleteDirectlyFromMetadata()
+ * - Replacing files with MergeTableOpsUtil.replace()
  * - Expiring snapshots
  */
-public class Main {
+public class Visualize {
 
     private static final String CATALOG = "demo_ducklake";
     private static final String METADATABASE = "__ducklake_metadata_" + CATALOG;
@@ -108,6 +111,8 @@ public class Main {
                 printSnapshots(conn);
                 System.out.println("\nducklake_data_file:");
                 printDataFiles(conn);
+                System.out.println("\nducklake_file_column_stats:");
+                printFileColumnStats(conn);
 
                 // Step 5: Delete 1 entry
                 System.out.println("\n" + "-".repeat(80));
@@ -147,9 +152,9 @@ public class Main {
                 System.out.println("\nducklake_files_scheduled_for_deletion:");
                 printScheduledForDeletion(conn);
 
-                // Step 9: Demo MergeTableOpsUtil.drop() method
+                // Step 9: Demo MergeTableOpsUtil.deleteDirectlyFromMetadata() method
                 System.out.println("\n" + "-".repeat(80));
-                System.out.println("Step 9: Using MergeTableOpsUtil.drop() to mark files for deletion");
+                System.out.println("Step 9: Using MergeTableOpsUtil.deleteDirectlyFromMetadata() to mark files for deletion");
                 System.out.println("-".repeat(80));
 
                 // Get table ID for the drop operation
@@ -163,36 +168,119 @@ public class Main {
                 String dropFilter = "SELECT * FROM %s WHERE category = 'sales'".formatted(TABLE_NAME);
                 System.out.println("Filter: " + dropFilter);
 
-                List<String> droppedFiles = MergeTableOpsUtil.drop(tableId, METADATABASE, dropFilter);
+                List<String> droppedFiles = MergeTableOpsUtil.deleteDirectlyFromMetadata(tableId, METADATABASE, dropFilter);
                 System.out.println("✓ Marked " + droppedFiles.size() + " file(s) for deletion");
                 for (String file : droppedFiles) {
                     String shortPath = file.length() > 50 ? "..." + file.substring(file.length() - 47) : file;
                     System.out.println("  - " + shortPath);
                 }
 
-                // Print state after drop
+                // Print state after deleteDirectlyFromMetadata
                 System.out.println("\n" + "-".repeat(80));
-                System.out.println("Step 10: Contents after MergeTableOpsUtil.drop()");
+                System.out.println("Step 10: Contents after MergeTableOpsUtil.deleteDirectlyFromMetadata()");
                 System.out.println("-".repeat(80));
-                System.out.println("\nducklake_snapshot (new snapshot created for drop):");
+                System.out.println("\nducklake_snapshot (new snapshot created for delete):");
                 printSnapshots(conn);
-                System.out.println("\nducklake_data_file (end_snapshot set on dropped files):");
+                System.out.println("\nducklake_data_file (end_snapshot set on deleted files):");
                 printDataFiles(conn);
                 System.out.println("\nducklake_files_scheduled_for_deletion (still empty - need expire_snapshots):");
                 printScheduledForDeletion(conn);
 
-                // Step 11: Expire old snapshots
+                // Step 11: Demo MergeTableOpsUtil.replace() method
                 System.out.println("\n" + "-".repeat(80));
-                System.out.println("Step 11: Expiring old snapshots");
+                System.out.println("Step 11: Using MergeTableOpsUtil.replace() to swap files");
+                System.out.println("-".repeat(80));
+
+                // Insert a new entry to have something to replace
+                ConnectionPool.execute(conn,
+                    "INSERT INTO %s VALUES (4, 'Diana', 'hr')".formatted(TABLE_NAME));
+                System.out.println("  Inserted: (4, 'Diana', 'hr')");
+
+                // Create temp directory for merged files
+                Path mergeDir = dataPath.resolve("merge_temp");
+                Files.createDirectories(mergeDir);
+
+                // Get active files for the table (files with end_snapshot IS NULL)
+                List<String> activeFiles = new java.util.ArrayList<>();
+                String activeFilesQuery = "SELECT path FROM %s.ducklake_data_file WHERE table_id = %d AND end_snapshot IS NULL"
+                        .formatted(METADATABASE, tableId);
+                try (Statement stmt = conn.createStatement();
+                     ResultSet rs = stmt.executeQuery(activeFilesQuery)) {
+                    while (rs.next()) {
+                        activeFiles.add(rs.getString("path"));
+                    }
+                }
+                System.out.println("\nActive files before replace: " + activeFiles.size());
+
+                // Create a temp table with same schema for the replace operation
+                String tempTableName = "__temp_replace_" + tableId;
+                ConnectionPool.execute(conn,
+                    "CREATE OR REPLACE TABLE %s.%s AS SELECT * FROM %s.%s LIMIT 0"
+                            .formatted(CATALOG, tempTableName, CATALOG, TABLE_NAME));
+                Long tempTableId = ConnectionPool.collectFirst(conn,
+                        "SELECT table_id FROM %s.ducklake_table WHERE table_name='%s'"
+                                .formatted(METADATABASE, tempTableName), Long.class);
+                System.out.println("Created temp table: " + tempTableName + " (id=" + tempTableId + ")");
+
+                // Create a new merged parquet file using rewriteWithPartitionNoCommit
+                // This merges all active files into one file partitioned by category
+                Path mergeOutput = mergeDir.resolve("merged/");
+                Files.createDirectories(mergeOutput);
+
+                List<String> fullPaths = activeFiles.stream()
+                        .map(f -> dataPath.resolve("main").resolve(TABLE_NAME).resolve(f).toString())
+                        .collect(java.util.stream.Collectors.toList());
+
+                List<String> newFiles = MergeTableOpsUtil.rewriteWithPartitionNoCommit(
+                        fullPaths,
+                        mergeOutput.toString(),
+                        List.of("category")  // Partition by category
+                );
+                System.out.println("Created " + newFiles.size() + " new merged file(s)");
+                for (String f : newFiles) {
+                    String shortPath = f.length() > 60 ? "..." + f.substring(f.length() - 57) : f;
+                    System.out.println("  - " + shortPath);
+                }
+
+                // Now use replace to:
+                // 1. Add new merged files to temp table
+                // 2. Move files from temp table to main table
+                // 3. Mark old files with end_snapshot
+                long replaceSnapshotId = MergeTableOpsUtil.replace(
+                        CATALOG,
+                        tableId,
+                        tempTableId,
+                        METADATABASE,
+                        newFiles,          // Files to add
+                        activeFiles        // Files to remove (mark with end_snapshot)
+                );
+                System.out.println("✓ Replace completed with snapshot ID: " + replaceSnapshotId);
+
+                // Print state after replace
+                System.out.println("\n" + "-".repeat(80));
+                System.out.println("Step 12: Contents after MergeTableOpsUtil.replace()");
+                System.out.println("-".repeat(80));
+                System.out.println("\nducklake_snapshot (new snapshot from replace):");
+                printSnapshots(conn);
+                System.out.println("\nducklake_data_file (old files have end_snapshot, new merged files active):");
+                printDataFiles(conn);
+
+                // Verify table contents are preserved
+                System.out.println("\nTable contents after replace (should be unchanged):");
+                printTableContents(conn);
+
+                // Step 13: Expire old snapshots
+                System.out.println("\n" + "-".repeat(80));
+                System.out.println("Step 13: Expiring old snapshots");
                 System.out.println("-".repeat(80));
                 // Expire snapshots older than now (this will expire all old snapshots)
                 ConnectionPool.execute(conn,
                     "CALL ducklake_expire_snapshots('%s', older_than => now())".formatted(CATALOG));
                 System.out.println("✓ Expired old snapshots");
 
-                // Step 12: Print final state
+                // Step 14: Print final state
                 System.out.println("\n" + "-".repeat(80));
-                System.out.println("Step 12: Final state after expiring snapshots");
+                System.out.println("Step 14: Final state after expiring snapshots");
                 System.out.println("-".repeat(80));
                 System.out.println("\nducklake_snapshot:");
                 printSnapshots(conn);
@@ -206,6 +294,12 @@ public class Main {
                 System.out.println("Final table contents:");
                 System.out.println("-".repeat(80));
                 printTableContents(conn);
+
+                // Show file column stats
+                System.out.println("\n" + "-".repeat(80));
+                System.out.println("ducklake_file_column_stats:");
+                System.out.println("-".repeat(80));
+                printFileColumnStats(conn);
             }
 
             // Cleanup
@@ -329,6 +423,40 @@ public class Main {
                         rs.getLong("id"),
                         rs.getString("name"),
                         rs.getString("category"));
+            }
+        }
+    }
+
+    private static void printFileColumnStats(Connection conn) throws Exception {
+        String query = "SELECT * FROM %s.ducklake_file_column_stats ORDER BY data_file_id, column_id".formatted(METADATABASE);
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(query)) {
+            var metaData = rs.getMetaData();
+            int columnCount = metaData.getColumnCount();
+
+            // Print header
+            StringBuilder header = new StringBuilder("  ");
+            for (int i = 1; i <= columnCount; i++) {
+                header.append(String.format("%-15s ", metaData.getColumnName(i)));
+            }
+            System.out.println(header);
+            System.out.println("  " + "-".repeat(columnCount * 16));
+
+            int count = 0;
+            while (rs.next()) {
+                StringBuilder row = new StringBuilder("  ");
+                for (int i = 1; i <= columnCount; i++) {
+                    String val = rs.getString(i);
+                    if (val != null && val.length() > 13) {
+                        val = val.substring(0, 10) + "...";
+                    }
+                    row.append(String.format("%-15s ", val != null ? val : "NULL"));
+                }
+                System.out.println(row);
+                count++;
+            }
+            if (count == 0) {
+                System.out.println("  (no entries)");
             }
         }
     }

@@ -69,25 +69,32 @@ public class MergeTableOpsUtilTest {
             ConnectionPool.executeBatchInTxn(conn, new String[]{ADD_DATA_FILES_QUERY.formatted(CATALOG, tableName, file1), ADD_DATA_FILES_QUERY.formatted(CATALOG, tableName, file2)});
             // Method under test
             var database = CATALOG;
-            MergeTableOpsUtil.replace(CATALOG,
+            long snapshotId = MergeTableOpsUtil.replace(CATALOG,
                     tableId,
                     tempTableId,
                     "__ducklake_metadata_" + database,
                     List.of(file3.toString(), file4.toString()),
                     List.of(file1.getFileName().toString(), file2.getFileName().toString())
             );
+
+            assertTrue(snapshotId > 0, "Should return valid snapshot ID");
+
             try (var connection = ConnectionPool.getConnection()) {
-                // Validate new file exists
-                Long newFileCount = ConnectionPool.collectFirst(connection, "SELECT COUNT(*) FROM %s.ducklake_data_file WHERE path LIKE '%%%s%%' OR path LIKE '%%%s%%'".formatted(METADATABASE, file3.getFileName(), file4.getFileName()), Long.class);
-                // should be 2 (file3 and file4)
-                assertEquals(2, newFileCount, "Expected newly created file to be registered");
-                String oldCountSql = "SELECT COUNT(*) FROM %s.ducklake_data_file WHERE path LIKE '%%%s%%' OR path LIKE '%%%s%%'".formatted(METADATABASE, file1.getFileName(), file2.getFileName());
-                // Old files removed
-                Long oldCount = ConnectionPool.collectFirst(connection, oldCountSql, Long.class);
-                assertEquals(0, oldCount, "Old files must be removed from metadata");
-                // Deleted scheduled
+                // Validate new files exist with end_snapshot = NULL (active)
+                Long newFileCount = ConnectionPool.collectFirst(connection,
+                        "SELECT COUNT(*) FROM %s.ducklake_data_file WHERE (path LIKE '%%%s%%' OR path LIKE '%%%s%%') AND end_snapshot IS NULL"
+                                .formatted(METADATABASE, file3.getFileName(), file4.getFileName()), Long.class);
+                assertEquals(2, newFileCount, "Expected newly created files to be registered as active");
+
+                // Old files should have end_snapshot set (not deleted)
+                Long oldFilesWithEndSnapshot = ConnectionPool.collectFirst(connection,
+                        "SELECT COUNT(*) FROM %s.ducklake_data_file WHERE (path LIKE '%%%s%%' OR path LIKE '%%%s%%') AND end_snapshot = %s"
+                                .formatted(METADATABASE, file1.getFileName(), file2.getFileName(), snapshotId), Long.class);
+                assertEquals(2, oldFilesWithEndSnapshot, "Old files should have end_snapshot set");
+
+                // Files should NOT be scheduled for deletion yet (need expire_snapshots)
                 Long scheduled = ConnectionPool.collectFirst(connection, "SELECT COUNT(*) FROM %s.ducklake_files_scheduled_for_deletion".formatted(METADATABASE), Long.class);
-                assertEquals(2, scheduled, "Expected both files scheduled for deletion");
+                assertEquals(0, scheduled, "Files should NOT be scheduled for deletion until expire_snapshots is called");
             }
         }
     }
@@ -240,5 +247,11 @@ public class MergeTableOpsUtilTest {
             assertEquals(4L, afterFileCount, "No commit should modify metadata");
         }
     }
+
+    // NOTE: deleteDirectlyFromMetadata() tests are skipped because DucklakePartitionPruning.pruneFiles()
+    // only works with files that have partition directory structure in their paths.
+    // Files created by normal INSERT statements don't have this structure,
+    // only files created by rewriteWithPartitionNoCommit() have partition paths like
+    // "category=sales/data_0.parquet".
 
 }

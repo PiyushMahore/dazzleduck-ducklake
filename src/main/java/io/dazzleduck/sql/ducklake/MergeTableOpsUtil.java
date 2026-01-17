@@ -12,13 +12,17 @@ import io.dazzleduck.sql.commons.ConnectionPool;
 import io.dazzleduck.sql.commons.FileStatus;
 import io.dazzleduck.sql.commons.ducklake.DucklakePartitionPruning;
 import io.dazzleduck.sql.commons.ingestion.CopyResult;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.stream.Collectors;
 
 public class MergeTableOpsUtil {
+    private static final Logger logger = LoggerFactory.getLogger(MergeTableOpsUtil.class);
 
+    private static final String GET_TABLE_ID_SQL = "SELECT table_id FROM %s.ducklake_table WHERE table_name = '%s'";
     private static final String ADD_FILE_TO_TABLE_QUERY = "CALL ducklake_add_data_files('%s', '%s', '%s', schema => 'main', ignore_extra_columns => true, allow_missing => true);";
     private static final String COPY_TO_NEW_FILE_WITH_PARTITION_QUERY = "COPY (SELECT * FROM read_parquet([%s])) TO '%s' (FORMAT PARQUET,%s RETURN_FILES);";
     private static final String GET_FILE_ID_BY_PATH_QUERY = "SELECT data_file_id FROM %s.ducklake_data_file WHERE table_id = %s AND path IN (%s);";
@@ -31,6 +35,7 @@ public class MergeTableOpsUtil {
 
     private static final String GET_TABLE_INFO_BY_ID_QUERY = "SELECT s.schema_name, t.table_name FROM %s.ducklake_table t JOIN %s.ducklake_schema s ON t.schema_id = s.schema_id WHERE t.table_id = %s;";
     private static final String GET_FILE_IDS_BY_TABLE_AND_PATHS_QUERY = "SELECT data_file_id FROM %s.ducklake_data_file WHERE table_id = %s AND path IN (%s);";
+
     /**
      * Replaces files in a table using proper DuckLake snapshot mechanism.
      *
@@ -50,23 +55,23 @@ public class MergeTableOpsUtil {
      * {@code ducklake_expire_snapshots()} is called, which moves them to
      * {@code ducklake_files_scheduled_for_deletion}.
      *
-     * @param database database/catalog name
-     * @param tableId id of the main table
+     * @param database    database/catalog name
+     * @param tableId     id of the main table
      * @param tempTableId temporary table id used for adding files (must have same schema as main table)
-     * @param mdDatabase metadata database name
-     * @param toAdd files to be added to the table
-     * @param toRemove files to be marked for deletion (by setting end_snapshot)
+     * @param mdDatabase  metadata database name
+     * @param toAdd       files to be added to the table
+     * @param toRemove    files to be marked for deletion (by setting end_snapshot)
      * @return the snapshot ID created for this replace operation, or -1 if both lists are empty
-     * @throws SQLException if a database access error occurs
+     * @throws SQLException             if a database access error occurs
      * @throws IllegalArgumentException if required parameters are null or blank
-     * @throws IllegalStateException if files to remove are not found
+     * @throws IllegalStateException    if files to remove are not found
      */
     public static long replace(String database,
-                        long tableId,
-                        long tempTableId,
-                        String mdDatabase,
-                        List<String> toAdd,
-                        List<String> toRemove) throws SQLException {
+                               long tableId,
+                               long tempTableId,
+                               String mdDatabase,
+                               List<String> toAdd,
+                               List<String> toRemove) throws SQLException {
         if (database == null || database.isBlank()) {
             throw new IllegalArgumentException("database cannot be null or blank");
         }
@@ -179,14 +184,14 @@ public class MergeTableOpsUtil {
      * @param inputFiles input files. Partitioned or un-partitioned.
      * @param partition
      * @return the list of newly created files. Note this will not update the metadata. It needs to be combined with replace function to make this changes visible to the table.
-     *
+     * <p>
      * input -> /data/log/a, /data/log/b
      * baseLocation -> /data/log
      * partition -> List.Of('date', applicationid).
      */
     public static List<String> rewriteWithPartitionNoCommit(List<String> inputFiles,
-                                                     String baseLocation,
-                                                     List<String> partition) throws SQLException {
+                                                            String baseLocation,
+                                                            List<String> partition) throws SQLException {
         if (inputFiles == null || inputFiles.isEmpty()) {
             throw new IllegalArgumentException("inputFiles cannot be null or empty");
         }
@@ -207,7 +212,7 @@ public class MergeTableOpsUtil {
      * @param inputFile input file..
      * @param partition
      * @return the list of newly created files. Note this will not update the metadata. It needs to be combined with replace function to make this changes visible to the table.
-     *
+     * <p>
      * input -> /data/log/a, /data/log/b
      * baseLocation -> /data/log
      * partition -> List.Of('date', applicationid).
@@ -253,13 +258,13 @@ public class MergeTableOpsUtil {
      * that have partition directory structure in their paths (e.g., "category=sales/data_0.parquet").
      * Files created by normal INSERT statements may not have this structure.
      *
-     * @param tableId the table ID whose files should be marked for deletion
+     * @param tableId    the table ID whose files should be marked for deletion
      * @param mdDatabase metadata database name
-     * @param filter SQL SELECT statement with WHERE clause to identify files to delete.
-     *               Files matching this filter (based on partition pruning) will be marked for deletion.
+     * @param filter     SQL SELECT statement with WHERE clause to identify files to delete.
+     *                   Files matching this filter (based on partition pruning) will be marked for deletion.
      * @return List of the file paths which are marked for deletion.
-     * @throws SQLException if a database access error occurs
-     * @throws JsonProcessingException if the filter SQL cannot be parsed
+     * @throws SQLException             if a database access error occurs
+     * @throws JsonProcessingException  if the filter SQL cannot be parsed
      * @throws IllegalArgumentException if filter or mdDatabase is null or blank
      */
     public static List<String> deleteDirectlyFromMetadata(long tableId, String mdDatabase, String filter) throws SQLException, JsonProcessingException {
@@ -341,11 +346,6 @@ public class MergeTableOpsUtil {
         }
     }
 
-    /**
-     * Record to hold table schema and name information.
-     */
-    public record TableInfo(String schemaName, String tableName) {}
-
     public static List<FileStatus> listFiles(String mdDatabase,
                                              long tableId,
                                              long minSize,
@@ -361,7 +361,7 @@ public class MergeTableOpsUtil {
         }
         List<FileStatus> filesToCompact = new ArrayList<>();
         String selectQuery = SELECT_DUCKLAKE_DATA_FILES_QUERY.formatted(mdDatabase, tableId, minSize, maxSize);
-        try (Connection conn = ConnectionPool.getConnection()){
+        try (Connection conn = ConnectionPool.getConnection()) {
             for (FileStatus file : ConnectionPool.collectAll(conn, selectQuery, FileStatus.class)) {
                 filesToCompact.add(file);
             }
@@ -369,5 +369,64 @@ public class MergeTableOpsUtil {
         return filesToCompact;
     }
 
+    /**
+     * Looks up the table ID for a given table name from DuckLake metadata.
+     *
+     * @param metadataDatabase The metadata database name (e.g., "__ducklake_metadata_<catalog>")
+     * @param tableName        The table name to look up
+     * @return The table ID, or null if not found
+     */
+    public static Long lookupTableId(String metadataDatabase, String tableName) {
+        if (metadataDatabase == null || metadataDatabase.isBlank()) {
+            logger.warn("Cannot lookup table_id: metadataDatabase is null or blank");
+            return null;
+        }
+        if (tableName == null || tableName.isBlank()) {
+            logger.warn("Cannot lookup table_id: tableName is null or blank");
+            return null;
+        }
 
+        try {
+            String sql = GET_TABLE_ID_SQL.formatted(metadataDatabase, escapeSql(tableName));
+            Long tableId = ConnectionPool.collectFirst(sql, Long.class);
+            if (tableId == null) {
+                logger.debug("Table '{}' not found in metadata database '{}'", tableName, metadataDatabase);
+            }
+            return tableId;
+        } catch (SQLException e) {
+            logger.error("Failed to lookup table_id for table '{}' in '{}': {}",
+                    tableName, metadataDatabase, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Looks up the table ID for a given table name, throwing an exception if not found.
+     *
+     * @param metadataDatabase The metadata database name
+     * @param tableName        The table name to look up
+     * @return The table ID
+     * @throws IllegalStateException if the table is not found
+     */
+    public static long requireTableId(String metadataDatabase, String tableName) {
+        Long tableId = lookupTableId(metadataDatabase, tableName);
+        if (tableId == null) {
+            throw new IllegalStateException(
+                    "Table '%s' not found in metadata database '%s'".formatted(tableName, metadataDatabase));
+        }
+        return tableId;
+    }
+
+    /**
+     * Escapes single quotes in SQL strings.
+     */
+    private static String escapeSql(String value) {
+        return value.replace("'", "''");
+    }
+
+    /**
+     * Record to hold table schema and name information.
+     */
+    public record TableInfo(String schemaName, String tableName) {
+    }
 }

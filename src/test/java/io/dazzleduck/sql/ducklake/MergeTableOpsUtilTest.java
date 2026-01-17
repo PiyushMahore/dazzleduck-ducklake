@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 
+import static io.dazzleduck.sql.ducklake.MergeTableOpsUtil.lookupTableId;
 import static org.junit.jupiter.api.Assertions.*;
 
 public class MergeTableOpsUtilTest {
@@ -58,10 +59,10 @@ public class MergeTableOpsUtilTest {
             };
             ConnectionPool.executeBatchInTxn(conn, setup);
 
-            Long tableId = DuckLakeUtil.lookupTableId(METADATABASE, tableName);
+            Long tableId = lookupTableId(METADATABASE, tableName);
             String dummyTable = "__dummy_" + tableId;
             ConnectionPool.execute("CREATE OR REPLACE TABLE %s.%s AS SELECT * FROM %s.%s LIMIT 0".formatted(CATALOG, dummyTable, CATALOG, tableName));
-            Long tempTableId = DuckLakeUtil.lookupTableId(METADATABASE, dummyTable);
+            Long tempTableId = lookupTableId(METADATABASE, dummyTable);
             // Register file1 & file2 as original files
             String ADD_DATA_FILES_QUERY = "CALL ducklake_add_data_files('%s','%s','%s')";
             ConnectionPool.executeBatchInTxn(conn, new String[]{ADD_DATA_FILES_QUERY.formatted(CATALOG, tableName, file1), ADD_DATA_FILES_QUERY.formatted(CATALOG, tableName, file2)});
@@ -118,11 +119,11 @@ public class MergeTableOpsUtilTest {
             };
             ConnectionPool.executeBatchInTxn(conn, setup);
 
-            Long tableId = DuckLakeUtil.lookupTableId(METADATABASE, tableName);
+            Long tableId = lookupTableId(METADATABASE, tableName);
             // Create temp dummy table
             String dummyTable = "__dummy_" + tableId;
             ConnectionPool.execute("CREATE OR REPLACE TABLE %s.%s AS SELECT * FROM %s.%s LIMIT 0".formatted(CATALOG, dummyTable, CATALOG, tableName));
-            Long tempTableId = DuckLakeUtil.lookupTableId(METADATABASE, dummyTable);
+            Long tempTableId = lookupTableId(METADATABASE, dummyTable);
 
             // Register file1 & file2 as original files in main table
             String ADD_DATA_FILES_QUERY = "CALL ducklake_add_data_files('%s','%s','%s')";
@@ -173,11 +174,11 @@ public class MergeTableOpsUtilTest {
             };
             ConnectionPool.executeBatchInTxn(conn, setup);
 
-            Long tableId = DuckLakeUtil.lookupTableId(METADATABASE, tableName);
+            Long tableId = lookupTableId(METADATABASE, tableName);
             // Create temp dummy table
             String dummyTable = "__dummy_" + tableId;
             ConnectionPool.execute("CREATE OR REPLACE TABLE %s.%s AS SELECT * FROM %s.%s LIMIT 0".formatted(CATALOG, dummyTable, CATALOG, tableName));
-            Long tempTableId = DuckLakeUtil.lookupTableId(METADATABASE, dummyTable);
+            Long tempTableId = lookupTableId(METADATABASE, dummyTable);
             // Register file1 only
             String ADD_DATA_FILES_QUERY = "CALL ducklake_add_data_files('%s','%s','%s')";
             ConnectionPool.executeBatchInTxn(conn, new String[]{ADD_DATA_FILES_QUERY.formatted(CATALOG, tableName, file1)});
@@ -218,7 +219,7 @@ public class MergeTableOpsUtilTest {
             };
             ConnectionPool.executeBatchInTxn(conn, inserts);
 
-            Long tableId = DuckLakeUtil.lookupTableId(METADATABASE, tableName);
+            Long tableId = lookupTableId(METADATABASE, tableName);
             
             // Capture original files
             var files = "SELECT CONCAT('%s', '%s', path) FROM %s.ducklake_data_file WHERE table_id = %s".formatted(tableDir.toString(), File.separator, METADATABASE, tableId);
@@ -269,7 +270,7 @@ public class MergeTableOpsUtilTest {
             };
             ConnectionPool.executeBatchInTxn(conn, inserts);
 
-            Long tableId = DuckLakeUtil.lookupTableId(METADATABASE, tableName);
+            Long tableId = lookupTableId(METADATABASE, tableName);
             var of = ConnectionPool.collectFirstColumn(conn, "SELECT CONCAT('%s', '%s', path) FROM %s.ducklake_data_file WHERE table_id=%s".formatted(tableDir.toString(), File.separator, METADATABASE, tableId), String.class).iterator();
             var originalFiles = new ArrayList<String>();
             while (of.hasNext()) {

@@ -22,34 +22,31 @@ import java.util.stream.Collectors;
 public class MergeTableOpsUtil {
     private static final Logger logger = LoggerFactory.getLogger(MergeTableOpsUtil.class);
 
-    private static final String GET_TABLE_ID_SQL = "SELECT table_id FROM %s.ducklake_table WHERE table_name = '%s'";
+    private static final String GET_TABLE_ID_SQL = "SELECT table_id FROM %s.main.ducklake_table WHERE table_name = '%s'";
     private static final String ADD_FILE_TO_TABLE_QUERY = "CALL ducklake_add_data_files('%s', '%s', '%s', schema => 'main', ignore_extra_columns => true, allow_missing => true);";
     private static final String COPY_TO_NEW_FILE_WITH_PARTITION_QUERY = "COPY (SELECT * FROM read_parquet([%s])) TO '%s' (FORMAT PARQUET,%s RETURN_FILES);";
-    private static final String GET_FILE_ID_BY_PATH_QUERY = "SELECT data_file_id FROM %s.ducklake_data_file WHERE table_id = %s AND path IN (%s);";
-    private static final String GET_TABLE_NAME_BY_ID = "SELECT table_name FROM %s.ducklake_table WHERE table_id = '%s';";
-    private static final String UPDATE_TABLE_ID_AND_SNAPSHOT = "UPDATE %s.ducklake_data_file SET table_id = %s, begin_snapshot = %s WHERE table_id = %s;";
-    private static final String SELECT_DUCKLAKE_DATA_FILES_QUERY = "SELECT path, file_size_bytes, end_snapshot FROM %s.ducklake_data_file WHERE table_id = %s AND file_size_bytes BETWEEN %s AND %s;";
-    private static final String CREATE_SNAPSHOT_QUERY = "INSERT INTO %s.ducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id) SELECT MAX(snapshot_id) + 1, now(), MAX(schema_version), MAX(next_catalog_id), MAX(next_file_id) FROM %s.ducklake_snapshot;";
-    private static final String GET_MAX_SNAPSHOT_ID_QUERY = "SELECT MAX(snapshot_id) FROM %s.ducklake_snapshot;";
-    private static final String SET_END_SNAPSHOT_QUERY = "UPDATE %s.ducklake_data_file SET end_snapshot = %s WHERE data_file_id IN (%s) AND end_snapshot IS NULL;";
+    private static final String GET_FILE_ID_BY_PATH_QUERY = "SELECT data_file_id FROM %s.main.ducklake_data_file WHERE table_id = %s AND path IN (%s);";
+    private static final String GET_TABLE_NAME_BY_ID = "SELECT table_name FROM %s.main.ducklake_table WHERE table_id = '%s';";
+    private static final String SELECT_DUCKLAKE_DATA_FILES_QUERY = "SELECT path, file_size_bytes, end_snapshot FROM %s.main.ducklake_data_file WHERE table_id = %s AND file_size_bytes BETWEEN %s AND %s;";
+    private static final String CREATE_SNAPSHOT_QUERY = "INSERT INTO %s.main.ducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id) SELECT MAX(snapshot_id) + 1, now(), MAX(schema_version), MAX(next_catalog_id), MAX(next_file_id) FROM %s.main.ducklake_snapshot;";
+    private static final String GET_MAX_SNAPSHOT_ID_QUERY = "SELECT MAX(snapshot_id) FROM %s.main.ducklake_snapshot;";
+    private static final String SET_END_SNAPSHOT_QUERY = "UPDATE %s.main.ducklake_data_file SET end_snapshot = %s WHERE data_file_id IN (%s) AND end_snapshot IS NULL;";
 
-    private static final String GET_TABLE_INFO_BY_ID_QUERY = "SELECT s.schema_name, t.table_name FROM %s.ducklake_table t JOIN %s.ducklake_schema s ON t.schema_id = s.schema_id WHERE t.table_id = %s;";
-    private static final String GET_FILE_IDS_BY_TABLE_AND_PATHS_QUERY = "SELECT data_file_id FROM %s.ducklake_data_file WHERE table_id = %s AND path IN (%s);";
+    private static final String GET_TABLE_INFO_BY_ID_QUERY = "SELECT s.schema_name, t.table_name FROM %s.main.ducklake_table t JOIN %s.main.ducklake_schema s ON t.schema_id = s.schema_id WHERE t.table_id = %s;";
+    private static final String GET_FILE_IDS_BY_TABLE_AND_PATHS_QUERY = "SELECT data_file_id FROM %s.main.ducklake_data_file WHERE table_id = %s AND path IN (%s);";
 
     /**
      * Replaces files in a table using proper DuckLake snapshot mechanism.
      *
      * <p>Due to {@code ducklake_add_data_files} auto-committing its transaction internally,
-     * this method uses a two-phase approach:
+     * this method uses a two-phase approach (remove first, then add):
      * <ol>
-     *   <li>Add new files to a temporary table (outside the main transaction)</li>
-     *   <li>In a single transaction: create snapshot, move files from temp to main table,
-     *       and set end_snapshot on files to be removed</li>
+     *   <li>In a single transaction: create snapshot, set end_snapshot on files to be removed</li>
+     *   <li>Add new files directly to the main table via {@code ducklake_add_data_files}</li>
      * </ol>
      *
-     * <p>This method is idempotent with respect to file additions: files that already exist
-     * in the temp table (from a previous failed attempt) will not be added again. This
-     * prevents duplicate data when retrying after a partial failure.
+     * <p>This ordering ensures that if the add phase fails, the removal is already committed
+     * and a retry only needs to add the missing files (idempotent - already-added files are skipped).
      *
      * <p>Files marked with end_snapshot remain visible in older snapshots until
      * {@code ducklake_expire_snapshots()} is called, which moves them to
@@ -57,7 +54,6 @@ public class MergeTableOpsUtil {
      *
      * @param database    database/catalog name
      * @param tableId     id of the main table
-     * @param tempTableId temporary table id used for adding files (must have same schema as main table)
      * @param mdDatabase  metadata database name
      * @param toAdd       files to be added to the table
      * @param toRemove    files to be marked for deletion (by setting end_snapshot)
@@ -68,7 +64,6 @@ public class MergeTableOpsUtil {
      */
     public static long replace(String database,
                                long tableId,
-                               long tempTableId,
                                String mdDatabase,
                                List<String> toAdd,
                                List<String> toRemove) throws SQLException {
@@ -91,91 +86,53 @@ public class MergeTableOpsUtil {
         }
 
         try (Connection conn = ConnectionPool.getConnection()) {
-            // Phase 1: Add files to temp table (outside transaction - ducklake_add_data_files auto-commits)
-            if (!toAdd.isEmpty()) {
-                String tempTableName = ConnectionPool.collectFirst(conn, GET_TABLE_NAME_BY_ID.formatted(mdDatabase, tempTableId), String.class);
+            String tableName = ConnectionPool.collectFirst(conn, GET_TABLE_NAME_BY_ID.formatted(mdDatabase, tableId), String.class);
+            if (tableName == null) {
+                throw new IllegalStateException("Table not found for tableId=" + tableId);
+            }
 
-                // Get existing file names in temp table to avoid duplicates on retry
+            long snapshotId = -1;
+
+            // Phase 1: Remove old files (auto-commit mode to avoid write-write conflicts
+            // with DuckLake's internal auto-committed operations on metadata tables)
+            if (!toRemove.isEmpty()) {
+                String filePaths = toQuotedSqlList(toRemove);
+                List<Long> fileIds = collectLongList(conn,
+                        GET_FILE_ID_BY_PATH_QUERY.formatted(mdDatabase, tableId, filePaths));
+
+                if (fileIds.size() != toRemove.size()) {
+                    throw new IllegalStateException("One or more files scheduled for deletion were not found for tableId=" + tableId);
+                }
+
+                // Create a new snapshot and mark files for deletion
+                snapshotId = createNewSnapshot(conn, mdDatabase);
+                markFilesAsDeleted(conn, mdDatabase, snapshotId, fileIds);
+            }
+
+            // Phase 2: Add new files directly to main table (ducklake_add_data_files auto-commits each call)
+            if (!toAdd.isEmpty()) {
+                // Get existing active file paths to avoid duplicates on retry
                 var existingFilesIterator = ConnectionPool.collectFirstColumn(conn,
-                        "SELECT path FROM %s.ducklake_data_file WHERE table_id = %s".formatted(mdDatabase, tempTableId),
+                        "SELECT path FROM %s.main.ducklake_data_file WHERE table_id = %s AND end_snapshot IS NULL".formatted(mdDatabase, tableId),
                         String.class).iterator();
                 List<String> existingFileNames = new ArrayList<>();
                 while (existingFilesIterator.hasNext()) {
-                    String path = existingFilesIterator.next();
-                    // Extract filename from stored path
-                    int lastSlash = path.lastIndexOf('/');
-                    existingFileNames.add(lastSlash >= 0 ? path.substring(lastSlash + 1) : path);
+                    existingFileNames.add(extractFileName(existingFilesIterator.next()));
                 }
 
                 for (String file : toAdd) {
-                    // Extract filename for exact comparison
-                    int lastSlash = file.lastIndexOf('/');
-                    String fileName = lastSlash >= 0 ? file.substring(lastSlash + 1) : file;
-                    boolean alreadyExists = existingFileNames.contains(fileName);
-
-                    if (!alreadyExists) {
-                        // Escape single quotes in file path to prevent SQL injection
-                        String escapedFile = file.replace("'", "''");
-                        ConnectionPool.execute(ADD_FILE_TO_TABLE_QUERY.formatted(database, tempTableName, escapedFile));
+                    String fileName = extractFileName(file);
+                    if (!existingFileNames.contains(fileName)) {
+                        String escapedFile = escapeSql(file);
+                        ConnectionPool.execute(ADD_FILE_TO_TABLE_QUERY.formatted(database, tableName, escapedFile));
                     }
                 }
+
+                // Return the latest snapshot (created by ducklake_add_data_files)
+                snapshotId = ConnectionPool.collectFirst(conn, GET_MAX_SNAPSHOT_ID_QUERY.formatted(mdDatabase), Long.class);
             }
 
-            // Phase 2: In a single transaction - create snapshot, move files, set end_snapshot
-            boolean transactionStarted = false;
-            try {
-                ConnectionPool.execute(conn, "BEGIN TRANSACTION;");
-                transactionStarted = true;
-
-                // Create a new snapshot for this replace operation
-                ConnectionPool.execute(conn, CREATE_SNAPSHOT_QUERY.formatted(mdDatabase, mdDatabase));
-                Long newSnapshotId = ConnectionPool.collectFirst(conn,
-                        GET_MAX_SNAPSHOT_ID_QUERY.formatted(mdDatabase), Long.class);
-
-                // Move new files from temp table to main table and set begin_snapshot
-                if (!toAdd.isEmpty()) {
-                    String updateNewFiles = UPDATE_TABLE_ID_AND_SNAPSHOT.formatted(mdDatabase, tableId, newSnapshotId, tempTableId);
-                    ConnectionPool.execute(conn, updateNewFiles);
-                }
-
-                // Set end_snapshot on files to be removed
-                if (!toRemove.isEmpty()) {
-                    // Escape single quotes in file paths to prevent SQL injection
-                    String filePaths = toRemove.stream()
-                            .map(fp -> "'" + fp.replace("'", "''") + "'")
-                            .collect(Collectors.joining(", "));
-
-                    var fileIdsIterator = ConnectionPool.collectFirstColumn(conn,
-                            GET_FILE_ID_BY_PATH_QUERY.formatted(mdDatabase, tableId, filePaths), Long.class).iterator();
-                    var fileIds = new ArrayList<Long>();
-                    while (fileIdsIterator.hasNext()) {
-                        fileIds.add(fileIdsIterator.next());
-                    }
-
-                    if (fileIds.size() != toRemove.size()) {
-                        throw new IllegalStateException("One or more files scheduled for deletion were not found for tableId=" + tableId);
-                    }
-
-                    String fileIdsString = fileIds.stream().map(String::valueOf).collect(Collectors.joining(", "));
-
-                    // Set end_snapshot on files to mark them as deleted in this snapshot
-                    String setEndSnapshotQuery = SET_END_SNAPSHOT_QUERY.formatted(mdDatabase, newSnapshotId, fileIdsString);
-                    ConnectionPool.execute(conn, setEndSnapshotQuery);
-                }
-
-                ConnectionPool.execute(conn, "COMMIT;");
-                return newSnapshotId;
-
-            } catch (Exception e) {
-                if (transactionStarted) {
-                    try {
-                        ConnectionPool.execute(conn, "ROLLBACK;");
-                    } catch (Exception rollbackEx) {
-                        e.addSuppressed(rollbackEx);
-                    }
-                }
-                throw e;
-            }
+            return snapshotId;
         }
     }
 
@@ -238,6 +195,10 @@ public class MergeTableOpsUtil {
     }
 
     private static List<String> getStrings(String inputFile, String baseLocation, List<String> partition, Connection conn) {
+        // Remove trailing slashes to prevent double slashes in partition paths
+        while (baseLocation.endsWith("/")) {
+            baseLocation = baseLocation.substring(0, baseLocation.length() - 1);
+        }
         String partitionClause = partition.isEmpty() ? "" : "PARTITION_BY (" + String.join(", ", partition) + "),";
         String copyQuery = COPY_TO_NEW_FILE_WITH_PARTITION_QUERY.formatted(inputFile, baseLocation, partitionClause);
 
@@ -295,52 +256,18 @@ public class MergeTableOpsUtil {
                 return List.of();
             }
 
-            // Get file IDs for files to remove - escape single quotes to prevent SQL injection
-            String filePaths = filesToRemove.stream()
-                    .map(fp -> "'" + fp.replace("'", "''") + "'")
-                    .collect(Collectors.joining(", "));
-            var fileIdsIterator = ConnectionPool.collectFirstColumn(conn,
-                    GET_FILE_IDS_BY_TABLE_AND_PATHS_QUERY.formatted(mdDatabase, tableId, filePaths), Long.class).iterator();
-            List<Long> fileIds = new ArrayList<>();
-            while (fileIdsIterator.hasNext()) {
-                fileIds.add(fileIdsIterator.next());
-            }
+            // Get file IDs for files to remove
+            String filePaths = toQuotedSqlList(new ArrayList<>(filesToRemove));
+            List<Long> fileIds = collectLongList(conn,
+                    GET_FILE_IDS_BY_TABLE_AND_PATHS_QUERY.formatted(mdDatabase, tableId, filePaths));
 
             if (fileIds.isEmpty()) {
                 return List.of();
             }
 
-            // Execute within a transaction
-            boolean transactionStarted = false;
-            try {
-                ConnectionPool.execute(conn, "BEGIN TRANSACTION;");
-                transactionStarted = true;
-
-                // Create a new snapshot for this drop operation
-                ConnectionPool.execute(conn, CREATE_SNAPSHOT_QUERY.formatted(mdDatabase, mdDatabase));
-                Long newSnapshotId = ConnectionPool.collectFirst(conn,
-                        GET_MAX_SNAPSHOT_ID_QUERY.formatted(mdDatabase), Long.class);
-
-                String fileIdsString = fileIds.stream()
-                        .map(String::valueOf)
-                        .collect(Collectors.joining(", "));
-
-                // Set end_snapshot on files to mark them as deleted in this snapshot
-                // Only update files that don't already have an end_snapshot (i.e., active files)
-                String setEndSnapshotQuery = SET_END_SNAPSHOT_QUERY.formatted(mdDatabase, newSnapshotId, fileIdsString);
-                ConnectionPool.execute(conn, setEndSnapshotQuery);
-
-                ConnectionPool.execute(conn, "COMMIT;");
-            } catch (Exception e) {
-                if (transactionStarted) {
-                    try {
-                        ConnectionPool.execute(conn, "ROLLBACK;");
-                    } catch (Exception rollbackEx) {
-                        e.addSuppressed(rollbackEx);
-                    }
-                }
-                throw e;
-            }
+            // Create a new snapshot and mark files for deletion
+            long newSnapshotId = createNewSnapshot(conn, mdDatabase);
+            markFilesAsDeleted(conn, mdDatabase, newSnapshotId, fileIds);
 
             return new ArrayList<>(filesToRemove);
         }
@@ -422,6 +349,55 @@ public class MergeTableOpsUtil {
      */
     private static String escapeSql(String value) {
         return value.replace("'", "''");
+    }
+
+    /**
+     * Converts a list of strings to a quoted SQL list (e.g., "'val1','val2'").
+     * Single quotes in values are escaped to prevent SQL injection.
+     */
+    private static String toQuotedSqlList(List<String> values) {
+        return values.stream()
+                .map(v -> "'" + v.replace("'", "''") + "'")
+                .collect(Collectors.joining(", "));
+    }
+
+    /**
+     * Extracts the filename from a file path.
+     * Handles both paths with '/' separators and plain filenames.
+     */
+    private static String extractFileName(String path) {
+        int lastSlash = path.lastIndexOf('/');
+        return lastSlash >= 0 ? path.substring(lastSlash + 1) : path;
+    }
+
+    /**
+     * Collects a list of Long values from a SQL query.
+     */
+    private static List<Long> collectLongList(Connection conn, String query) throws SQLException {
+        var iterator = ConnectionPool.collectFirstColumn(conn, query, Long.class).iterator();
+        List<Long> result = new ArrayList<>();
+        while (iterator.hasNext()) {
+            result.add(iterator.next());
+        }
+        return result;
+    }
+
+    /**
+     * Creates a new DuckLake snapshot and returns its ID.
+     */
+    private static long createNewSnapshot(Connection conn, String mdDatabase) throws SQLException {
+        ConnectionPool.execute(conn, CREATE_SNAPSHOT_QUERY.formatted(mdDatabase, mdDatabase));
+        return ConnectionPool.collectFirst(conn, GET_MAX_SNAPSHOT_ID_QUERY.formatted(mdDatabase), Long.class);
+    }
+
+    /**
+     * Marks files for deletion by setting their end_snapshot.
+     */
+    private static void markFilesAsDeleted(Connection conn, String mdDatabase, long snapshotId, List<Long> fileIds) throws SQLException {
+        String fileIdsString = fileIds.stream()
+                .map(String::valueOf)
+                .collect(Collectors.joining(", "));
+        ConnectionPool.execute(conn, SET_END_SNAPSHOT_QUERY.formatted(mdDatabase, snapshotId, fileIdsString));
     }
 
     /**

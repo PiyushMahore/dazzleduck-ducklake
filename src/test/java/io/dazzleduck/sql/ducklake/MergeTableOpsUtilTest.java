@@ -70,7 +70,6 @@ public class MergeTableOpsUtilTest {
             var database = CATALOG;
             long snapshotId = MergeTableOpsUtil.replace(CATALOG,
                     tableId,
-                    tempTableId,
                     "__ducklake_metadata_" + database,
                     List.of(file3.toString(), file4.toString()),
                     List.of(file1.getFileName().toString(), file2.getFileName().toString())
@@ -140,7 +139,6 @@ public class MergeTableOpsUtilTest {
             var database = CATALOG;
             MergeTableOpsUtil.replace(CATALOG,
                     tableId,
-                    tempTableId,
                     "__ducklake_metadata_" + database,
                     List.of(file3.toString(), file4.toString()),
                     List.of(file1.getFileName().toString(), file2.getFileName().toString())
@@ -187,7 +185,6 @@ public class MergeTableOpsUtilTest {
                     IllegalStateException.class,
                     () -> MergeTableOpsUtil.replace( database,
                             tableId,
-                            tempTableId,
                             "__ducklake_metadata_" + database,
                             List.of(file3.toString()),
                             List.of(file1.getFileName().toString(), "file2 does not exist")

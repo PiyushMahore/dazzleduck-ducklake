@@ -21,7 +21,7 @@ import java.util.stream.Collectors;
 
 public class MergeTableOpsUtil {
     private static final Logger logger = LoggerFactory.getLogger(MergeTableOpsUtil.class);
-
+    // seems like .main should not be there need to fix this
     private static final String GET_TABLE_ID_SQL = "SELECT table_id FROM %s.main.ducklake_table WHERE table_name = '%s'";
     private static final String ADD_FILE_TO_TABLE_QUERY = "CALL ducklake_add_data_files('%s', '%s', '%s', schema => 'main', ignore_extra_columns => true, allow_missing => true);";
     private static final String COPY_TO_NEW_FILE_WITH_PARTITION_QUERY = "COPY (SELECT * FROM read_parquet([%s])) TO '%s' (FORMAT PARQUET,%s RETURN_FILES);";
@@ -112,6 +112,7 @@ public class MergeTableOpsUtil {
             // Phase 2: Add new files directly to main table (ducklake_add_data_files auto-commits each call)
             if (!toAdd.isEmpty()) {
                 // Get existing active file paths to avoid duplicates on retry
+                // seems like .main should not be there need to fix this
                 var existingFilesIterator = ConnectionPool.collectFirstColumn(conn,
                         "SELECT path FROM %s.main.ducklake_data_file WHERE table_id = %s AND end_snapshot IS NULL".formatted(mdDatabase, tableId),
                         String.class).iterator();

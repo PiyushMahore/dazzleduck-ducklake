@@ -21,19 +21,65 @@ import java.util.stream.Collectors;
 
 public class MergeTableOpsUtil {
     private static final Logger logger = LoggerFactory.getLogger(MergeTableOpsUtil.class);
-    // seems like .main should not be there need to fix this
-    private static final String GET_TABLE_ID_SQL = "SELECT table_id FROM %s.main.ducklake_table WHERE table_name = '%s'";
-    private static final String ADD_FILE_TO_TABLE_QUERY = "CALL ducklake_add_data_files('%s', '%s', '%s', schema => 'main', ignore_extra_columns => true, allow_missing => true);";
-    private static final String COPY_TO_NEW_FILE_WITH_PARTITION_QUERY = "COPY (SELECT * FROM read_parquet([%s])) TO '%s' (FORMAT PARQUET,%s RETURN_FILES);";
-    private static final String GET_FILE_ID_BY_PATH_QUERY = "SELECT data_file_id FROM %s.main.ducklake_data_file WHERE table_id = %s AND path IN (%s);";
-    private static final String GET_TABLE_NAME_BY_ID = "SELECT table_name FROM %s.main.ducklake_table WHERE table_id = '%s';";
-    private static final String SELECT_DUCKLAKE_DATA_FILES_QUERY = "SELECT path, file_size_bytes, end_snapshot FROM %s.main.ducklake_data_file WHERE table_id = %s AND file_size_bytes BETWEEN %s AND %s;";
-    private static final String CREATE_SNAPSHOT_QUERY = "INSERT INTO %s.main.ducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id) SELECT MAX(snapshot_id) + 1, now(), MAX(schema_version), MAX(next_catalog_id), MAX(next_file_id) FROM %s.main.ducklake_snapshot;";
-    private static final String GET_MAX_SNAPSHOT_ID_QUERY = "SELECT MAX(snapshot_id) FROM %s.main.ducklake_snapshot;";
-    private static final String SET_END_SNAPSHOT_QUERY = "UPDATE %s.main.ducklake_data_file SET end_snapshot = %s WHERE data_file_id IN (%s) AND end_snapshot IS NULL;";
 
-    private static final String GET_TABLE_INFO_BY_ID_QUERY = "SELECT s.schema_name, t.table_name FROM %s.main.ducklake_table t JOIN %s.main.ducklake_schema s ON t.schema_id = s.schema_id WHERE t.table_id = %s;";
-    private static final String GET_FILE_IDS_BY_TABLE_AND_PATHS_QUERY = "SELECT data_file_id FROM %s.main.ducklake_data_file WHERE table_id = %s AND path IN (%s);";
+    // Queries use %s for mdDatabase and %s for schema qualifier (via MetadataConfig.q())
+    private static String getTableIdSql(String mdDatabase, String tableName) {
+        return "SELECT table_id FROM %s%sducklake_table WHERE table_name = '%s'"
+                .formatted(mdDatabase, MetadataConfig.q(), tableName);
+    }
+
+    private static String getFileIdByPathQuery(String mdDatabase, long tableId, String filePaths) {
+        return "SELECT data_file_id FROM %s%sducklake_data_file WHERE table_id = %s AND path IN (%s)"
+                .formatted(mdDatabase, MetadataConfig.q(), tableId, filePaths);
+    }
+
+    private static String getTableNameById(String mdDatabase, long tableId) {
+        return "SELECT table_name FROM %s%sducklake_table WHERE table_id = '%s'"
+                .formatted(mdDatabase, MetadataConfig.q(), tableId);
+    }
+
+    private static String selectDucklakeDataFilesQuery(String mdDatabase, long tableId, long minSize, long maxSize) {
+        return "SELECT path, file_size_bytes, end_snapshot FROM %s%sducklake_data_file WHERE table_id = %s AND file_size_bytes BETWEEN %s AND %s"
+                .formatted(mdDatabase, MetadataConfig.q(), tableId, minSize, maxSize);
+    }
+
+    private static String createSnapshotQuery(String mdDatabase) {
+        return "INSERT INTO %s%sducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id) SELECT MAX(snapshot_id) + 1, now(), MAX(schema_version), MAX(next_catalog_id), MAX(next_file_id) FROM %s%sducklake_snapshot"
+                .formatted(mdDatabase, MetadataConfig.q(), mdDatabase, MetadataConfig.q());
+    }
+
+    private static String getMaxSnapshotIdQuery(String mdDatabase) {
+        return "SELECT MAX(snapshot_id) FROM %s%sducklake_snapshot"
+                .formatted(mdDatabase, MetadataConfig.q());
+    }
+
+    private static String setEndSnapshotQuery(String mdDatabase, long snapshotId, String fileIds) {
+        return "UPDATE %s%sducklake_data_file SET end_snapshot = %s WHERE data_file_id IN (%s) AND end_snapshot IS NULL"
+                .formatted(mdDatabase, MetadataConfig.q(), snapshotId, fileIds);
+    }
+
+    private static String getTableInfoByIdQuery(String mdDatabase, long tableId) {
+        return "SELECT s.schema_name, t.table_name FROM %s%sducklake_table t JOIN %s%sducklake_schema s ON t.schema_id = s.schema_id WHERE t.table_id = %s"
+                .formatted(mdDatabase, MetadataConfig.q(), mdDatabase, MetadataConfig.q(), tableId);
+    }
+
+    private static String getFileIdsByTableAndPathsQuery(String mdDatabase, long tableId, String filePaths) {
+        return "SELECT data_file_id FROM %s%sducklake_data_file WHERE table_id = %s AND path IN (%s)"
+                .formatted(mdDatabase, MetadataConfig.q(), tableId, filePaths);
+    }
+
+    private static String getExistingActiveFilesQuery(String mdDatabase, long tableId) {
+        return "SELECT path FROM %s%sducklake_data_file WHERE table_id = %s AND end_snapshot IS NULL"
+                .formatted(mdDatabase, MetadataConfig.q(), tableId);
+    }
+
+    // ADD_FILE_TO_TABLE_QUERY does not need qualifier - it's a CALL statement, not a metadata query
+    private static final String ADD_FILE_TO_TABLE_QUERY =
+            "CALL ducklake_add_data_files('%s', '%s', '%s', schema => 'main', ignore_extra_columns => true, allow_missing => true);";
+
+    // COPY query does not touch metadata tables, no qualifier needed
+    private static final String COPY_TO_NEW_FILE_WITH_PARTITION_QUERY =
+            "COPY (SELECT * FROM read_parquet([%s])) TO '%s' (FORMAT PARQUET,%s RETURN_FILES);";
 
     /**
      * Replaces files in a table using proper DuckLake snapshot mechanism.
@@ -86,7 +132,7 @@ public class MergeTableOpsUtil {
         }
 
         try (Connection conn = ConnectionPool.getConnection()) {
-            String tableName = ConnectionPool.collectFirst(conn, GET_TABLE_NAME_BY_ID.formatted(mdDatabase, tableId), String.class);
+            String tableName = ConnectionPool.collectFirst(conn, getTableNameById(mdDatabase, tableId), String.class);
             if (tableName == null) {
                 throw new IllegalStateException("Table not found for tableId=" + tableId);
             }
@@ -97,8 +143,7 @@ public class MergeTableOpsUtil {
             // with DuckLake's internal auto-committed operations on metadata tables)
             if (!toRemove.isEmpty()) {
                 String filePaths = toQuotedSqlList(toRemove);
-                List<Long> fileIds = collectLongList(conn,
-                        GET_FILE_ID_BY_PATH_QUERY.formatted(mdDatabase, tableId, filePaths));
+                List<Long> fileIds = collectLongList(conn, getFileIdByPathQuery(mdDatabase, tableId, filePaths));
 
                 if (fileIds.size() != toRemove.size()) {
                     throw new IllegalStateException("One or more files scheduled for deletion were not found for tableId=" + tableId);
@@ -114,7 +159,7 @@ public class MergeTableOpsUtil {
                 // Get existing active file paths to avoid duplicates on retry
                 // seems like .main should not be there need to fix this
                 var existingFilesIterator = ConnectionPool.collectFirstColumn(conn,
-                        "SELECT path FROM %s.main.ducklake_data_file WHERE table_id = %s AND end_snapshot IS NULL".formatted(mdDatabase, tableId),
+                        getExistingActiveFilesQuery(mdDatabase, tableId),
                         String.class).iterator();
                 List<String> existingFileNames = new ArrayList<>();
                 while (existingFilesIterator.hasNext()) {
@@ -128,9 +173,6 @@ public class MergeTableOpsUtil {
                         ConnectionPool.execute(ADD_FILE_TO_TABLE_QUERY.formatted(database, tableName, escapedFile));
                     }
                 }
-
-                // Return the latest snapshot (created by ducklake_add_data_files)
-                snapshotId = ConnectionPool.collectFirst(conn, GET_MAX_SNAPSHOT_ID_QUERY.formatted(mdDatabase), Long.class);
             }
 
             return snapshotId;
@@ -240,7 +282,7 @@ public class MergeTableOpsUtil {
         try (Connection conn = ConnectionPool.getConnection()) {
             // Get table schema and name for partition pruning
             var tableInfoIterator = ConnectionPool.collectAll(conn,
-                    GET_TABLE_INFO_BY_ID_QUERY.formatted(mdDatabase, mdDatabase, tableId), TableInfo.class).iterator();
+                    getTableInfoByIdQuery(mdDatabase, tableId), TableInfo.class).iterator();
             if (!tableInfoIterator.hasNext()) {
                 throw new IllegalStateException("Table not found for tableId=" + tableId);
             }
@@ -260,7 +302,7 @@ public class MergeTableOpsUtil {
             // Get file IDs for files to remove
             String filePaths = toQuotedSqlList(new ArrayList<>(filesToRemove));
             List<Long> fileIds = collectLongList(conn,
-                    GET_FILE_IDS_BY_TABLE_AND_PATHS_QUERY.formatted(mdDatabase, tableId, filePaths));
+                    getFileIdsByTableAndPathsQuery(mdDatabase, tableId, filePaths));
 
             if (fileIds.isEmpty()) {
                 return List.of();
@@ -288,9 +330,8 @@ public class MergeTableOpsUtil {
             throw new IllegalArgumentException("maxSize cannot be less than minSize");
         }
         List<FileStatus> filesToCompact = new ArrayList<>();
-        String selectQuery = SELECT_DUCKLAKE_DATA_FILES_QUERY.formatted(mdDatabase, tableId, minSize, maxSize);
         try (Connection conn = ConnectionPool.getConnection()) {
-            for (FileStatus file : ConnectionPool.collectAll(conn, selectQuery, FileStatus.class)) {
+            for (FileStatus file : ConnectionPool.collectAll(conn, selectDucklakeDataFilesQuery(mdDatabase, tableId, minSize, maxSize), FileStatus.class)) {
                 filesToCompact.add(file);
             }
         }
@@ -315,8 +356,7 @@ public class MergeTableOpsUtil {
         }
 
         try {
-            String sql = GET_TABLE_ID_SQL.formatted(metadataDatabase, escapeSql(tableName));
-            Long tableId = ConnectionPool.collectFirst(sql, Long.class);
+            Long tableId = ConnectionPool.collectFirst(getTableIdSql(metadataDatabase, escapeSql(tableName)), Long.class);
             if (tableId == null) {
                 logger.debug("Table '{}' not found in metadata database '{}'", tableName, metadataDatabase);
             }
@@ -387,18 +427,15 @@ public class MergeTableOpsUtil {
      * Creates a new DuckLake snapshot and returns its ID.
      */
     private static long createNewSnapshot(Connection conn, String mdDatabase) throws SQLException {
-        ConnectionPool.execute(conn, CREATE_SNAPSHOT_QUERY.formatted(mdDatabase, mdDatabase));
-        return ConnectionPool.collectFirst(conn, GET_MAX_SNAPSHOT_ID_QUERY.formatted(mdDatabase), Long.class);
+        ConnectionPool.execute(conn, createSnapshotQuery(mdDatabase));
+        return ConnectionPool.collectFirst(conn, getMaxSnapshotIdQuery(mdDatabase), Long.class);
     }
 
-    /**
-     * Marks files for deletion by setting their end_snapshot.
-     */
     private static void markFilesAsDeleted(Connection conn, String mdDatabase, long snapshotId, List<Long> fileIds) throws SQLException {
         String fileIdsString = fileIds.stream()
                 .map(String::valueOf)
                 .collect(Collectors.joining(", "));
-        ConnectionPool.execute(conn, SET_END_SNAPSHOT_QUERY.formatted(mdDatabase, snapshotId, fileIdsString));
+        ConnectionPool.execute(conn, setEndSnapshotQuery(mdDatabase, snapshotId, fileIdsString));
     }
 
     /**

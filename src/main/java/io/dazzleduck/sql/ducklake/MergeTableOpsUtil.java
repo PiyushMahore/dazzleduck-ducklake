@@ -1,11 +1,12 @@
 package io.dazzleduck.sql.ducklake;
 
-import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import io.dazzleduck.sql.commons.ConnectionPool;
@@ -16,377 +17,307 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.stream.Collectors;
 
 public class MergeTableOpsUtil {
     private static final Logger logger = LoggerFactory.getLogger(MergeTableOpsUtil.class);
 
-    // Queries use %s for mdDatabase and %s for schema qualifier (via MetadataConfig.q())
-    private static String getTableIdSql(String mdDatabase, String tableName) {
+    // -------------------------------------------------------------------------
+    // SQL query builders — DuckDB / generic metadata path
+    // All use mdDatabase + MetadataConfig.q() as a schema prefix.
+    // -------------------------------------------------------------------------
+
+    private static String tableIdByNameQuery(String mdDatabase, String tableName) {
         return "SELECT table_id FROM %s%sducklake_table WHERE table_name = '%s'"
                 .formatted(mdDatabase, MetadataConfig.q(), tableName);
     }
 
-    private static String getFileIdByPathQuery(String mdDatabase, long tableId, String filePaths) {
-        return "SELECT data_file_id FROM %s%sducklake_data_file WHERE table_id = %s AND path IN (%s)"
-                .formatted(mdDatabase, MetadataConfig.q(), tableId, filePaths);
-    }
-
-    private static String getTableNameById(String mdDatabase, long tableId) {
-        return "SELECT table_name FROM %s%sducklake_table WHERE table_id = '%s'"
+    private static String tableNameByIdQuery(String mdDatabase, long tableId) {
+        return "SELECT table_name FROM %s%sducklake_table WHERE table_id = %s"
                 .formatted(mdDatabase, MetadataConfig.q(), tableId);
     }
 
-    private static String selectDucklakeDataFilesQuery(String mdDatabase, long tableId, long minSize, long maxSize) {
-        return "SELECT path, file_size_bytes, end_snapshot FROM %s%sducklake_data_file WHERE table_id = %s AND file_size_bytes BETWEEN %s AND %s"
+    private static String tableInfoByIdQuery(String mdDatabase, long tableId) {
+        return ("SELECT s.schema_name, t.table_name "
+                + "FROM %s%sducklake_table t JOIN %s%sducklake_schema s ON t.schema_id = s.schema_id "
+                + "WHERE t.table_id = %s")
+                .formatted(mdDatabase, MetadataConfig.q(), mdDatabase, MetadataConfig.q(), tableId);
+    }
+
+    private static String activeFilePathsQuery(String mdDatabase, long tableId) {
+        return "SELECT path FROM %s%sducklake_data_file WHERE table_id = %s AND end_snapshot IS NULL"
+                .formatted(mdDatabase, MetadataConfig.q(), tableId);
+    }
+
+    private static String fileIdsByPathQuery(String mdDatabase, long tableId, String quotedPaths) {
+        return "SELECT data_file_id FROM %s%sducklake_data_file WHERE table_id = %s AND path IN (%s)"
+                .formatted(mdDatabase, MetadataConfig.q(), tableId, quotedPaths);
+    }
+
+    private static String dataFilesInSizeRangeQuery(String mdDatabase, long tableId, long minSize, long maxSize) {
+        return ("SELECT path, file_size_bytes, end_snapshot FROM %s%sducklake_data_file "
+                + "WHERE table_id = %s AND file_size_bytes BETWEEN %s AND %s")
                 .formatted(mdDatabase, MetadataConfig.q(), tableId, minSize, maxSize);
     }
 
     private static String createSnapshotQuery(String mdDatabase) {
-        return "INSERT INTO %s%sducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id) SELECT MAX(snapshot_id) + 1, now(), MAX(schema_version), MAX(next_catalog_id), MAX(next_file_id) FROM %s%sducklake_snapshot"
+        return ("INSERT INTO %s%sducklake_snapshot "
+                + "(snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id) "
+                + "SELECT MAX(snapshot_id) + 1, now(), MAX(schema_version), MAX(next_catalog_id), MAX(next_file_id) "
+                + "FROM %s%sducklake_snapshot")
                 .formatted(mdDatabase, MetadataConfig.q(), mdDatabase, MetadataConfig.q());
     }
 
-    private static String getMaxSnapshotIdQuery(String mdDatabase) {
+    private static String maxSnapshotIdQuery(String mdDatabase) {
         return "SELECT MAX(snapshot_id) FROM %s%sducklake_snapshot"
                 .formatted(mdDatabase, MetadataConfig.q());
     }
 
     private static String setEndSnapshotQuery(String mdDatabase, long snapshotId, String fileIds) {
-        return "UPDATE %s%sducklake_data_file SET end_snapshot = %s WHERE data_file_id IN (%s) AND end_snapshot IS NULL"
+        return ("UPDATE %s%sducklake_data_file SET end_snapshot = %s "
+                + "WHERE data_file_id IN (%s) AND end_snapshot IS NULL")
                 .formatted(mdDatabase, MetadataConfig.q(), snapshotId, fileIds);
     }
 
-    private static String getTableInfoByIdQuery(String mdDatabase, long tableId) {
-        return "SELECT s.schema_name, t.table_name FROM %s%sducklake_table t JOIN %s%sducklake_schema s ON t.schema_id = s.schema_id WHERE t.table_id = %s"
-                .formatted(mdDatabase, MetadataConfig.q(), mdDatabase, MetadataConfig.q(), tableId);
-    }
-
-    private static String getFileIdsByTableAndPathsQuery(String mdDatabase, long tableId, String filePaths) {
-        return "SELECT data_file_id FROM %s%sducklake_data_file WHERE table_id = %s AND path IN (%s)"
-                .formatted(mdDatabase, MetadataConfig.q(), tableId, filePaths);
-    }
-
-    private static String getExistingActiveFilesQuery(String mdDatabase, long tableId) {
-        return "SELECT path FROM %s%sducklake_data_file WHERE table_id = %s AND end_snapshot IS NULL"
-                .formatted(mdDatabase, MetadataConfig.q(), tableId);
-    }
-
     private static String moveFilesToMainTableQuery(String mdDatabase, long mainTableId, long tempTableId, long snapshotId) {
-        return "UPDATE %s%sducklake_data_file SET table_id = %s, begin_snapshot = %s WHERE table_id = %s AND end_snapshot IS NULL"
+        return ("UPDATE %s%sducklake_data_file SET table_id = %s, begin_snapshot = %s "
+                + "WHERE table_id = %s AND end_snapshot IS NULL")
                 .formatted(mdDatabase, MetadataConfig.q(), mainTableId, snapshotId, tempTableId);
     }
 
-    // ADD_FILE_TO_TABLE_QUERY does not need qualifier - it's a CALL statement, not a metadata query
+    // -------------------------------------------------------------------------
+    // SQL query builders — direct Postgres JDBC path
+    // Used when MetadataConfig.isPostgres() == true so that INSERT...RETURNING
+    // works natively without going through DuckDB's Postgres scanner.
+    // DuckLake stores metadata in Postgres's "public" schema ("main" is DuckDB-internal).
+    // -------------------------------------------------------------------------
+
+    private static final String PG_SCHEMA = "public";
+
+    private static String pgCreateSnapshotQuery() {
+        return ("INSERT INTO %s.ducklake_snapshot "
+                + "(snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id) "
+                + "SELECT MAX(snapshot_id) + 1, now(), MAX(schema_version), MAX(next_catalog_id), MAX(next_file_id) "
+                + "FROM %s.ducklake_snapshot RETURNING snapshot_id")
+                .formatted(PG_SCHEMA, PG_SCHEMA);
+    }
+
+    private static String pgFileIdsByPathQuery(long tableId, String quotedPaths) {
+        return "SELECT data_file_id FROM %s.ducklake_data_file WHERE table_id = %s AND path IN (%s)"
+                .formatted(PG_SCHEMA, tableId, quotedPaths);
+    }
+
+    private static String pgSetEndSnapshotQuery(long snapshotId, String fileIds) {
+        return ("UPDATE %s.ducklake_data_file SET end_snapshot = %s "
+                + "WHERE data_file_id IN (%s) AND end_snapshot IS NULL")
+                .formatted(PG_SCHEMA, snapshotId, fileIds);
+    }
+
+    private static String pgMoveFilesToMainTableQuery(long mainTableId, long tempTableId, long snapshotId) {
+        return ("UPDATE %s.ducklake_data_file SET table_id = %s, begin_snapshot = %s "
+                + "WHERE table_id = %s AND end_snapshot IS NULL")
+                .formatted(PG_SCHEMA, mainTableId, snapshotId, tempTableId);
+    }
+
+    // -------------------------------------------------------------------------
+    // DuckDB statement templates (no metadata schema prefix needed)
+    // -------------------------------------------------------------------------
+
     private static final String ADD_FILE_TO_TABLE_QUERY =
             "CALL ducklake_add_data_files('%s', '%s', '%s', schema => 'main', ignore_extra_columns => true, allow_missing => true);";
 
-    // COPY query does not touch metadata tables, no qualifier needed
-    private static final String COPY_TO_NEW_FILE_WITH_PARTITION_QUERY =
+    private static final String COPY_WITH_PARTITION_QUERY =
             "COPY (SELECT * FROM read_parquet([%s])) TO '%s' (FORMAT PARQUET,%s RETURN_FILES);";
 
+    // =========================================================================
+    // Public API
+    // =========================================================================
+
     /**
-     * Replaces files in a table using proper DuckLake snapshot mechanism.
+     * Replaces files in a table using the DuckLake snapshot mechanism.
      *
-     * <p>Since {@code ducklake_add_data_files} auto-commits internally, this method uses a
-     * temp-table approach to achieve full transactional atomicity:
+     * <p>Because {@code ducklake_add_data_files} auto-commits internally, a temp-table
+     * approach is used for atomicity:
      * <ol>
-     *   <li>Phase 1 (outside transaction): Add new files to a temp table via
-     *       {@code ducklake_add_data_files} (auto-commits to temp table only)</li>
-     *   <li>Phase 2 (single transaction): Create snapshot, move file records from temp to main
-     *       table, and mark old files with end_snapshot — all atomically committed or rolled back</li>
+     *   <li>Phase 1 (outside transaction): register new files under a temp table via
+     *       {@code ducklake_add_data_files} (auto-commits to temp table only).</li>
+     *   <li>Phase 2 (single atomic transaction): create a snapshot, move temp-table file
+     *       records to the main table, and retire old files with {@code end_snapshot}.</li>
      * </ol>
      *
-     * <p>Supports any combination: toAdd only, toRemove only, or both.
+     * <p>When a direct Postgres connection is configured ({@link MetadataConfig#isPostgres()}),
+     * Phase 2 uses {@code INSERT...RETURNING} for race-free snapshot ID generation.
+     * Otherwise a two-query approach is used (suitable for SQLite/DuckDB backends).
      *
-     * <p>Files marked with end_snapshot remain visible in older snapshots until
-     * {@code ducklake_expire_snapshots()} is called, which moves them to
-     * {@code ducklake_files_scheduled_for_deletion}.
+     * <p>Files retired with {@code end_snapshot} remain visible in older snapshots until
+     * {@code ducklake_expire_snapshots()} is called.
      *
-     * @param database    database/catalog name
-     * @param tableId     id of the main table
+     * @param database    catalog name
+     * @param tableId     ID of the main table
      * @param mdDatabase  metadata database name
-     * @param toAdd       files to be added to the table (can be empty)
-     * @param toRemove    files to be marked for deletion (can be empty)
-     * @return the snapshot ID created for this replace operation, or -1 if both lists are empty
-     * @throws SQLException             if a database access error occurs
+     * @param toAdd       absolute paths of files to register (may be empty)
+     * @param toRemove    file names to retire (may be empty)
+     * @return the new snapshot ID, or -1 if both lists are empty
+     * @throws SQLException             on database access errors
      * @throws IllegalArgumentException if required parameters are null or blank
-     * @throws IllegalStateException    if files to remove are not found
+     * @throws IllegalStateException    if files to remove are not found in metadata
      */
     public static long replace(String database,
                                long tableId,
                                String mdDatabase,
                                List<String> toAdd,
                                List<String> toRemove) throws SQLException {
-        if (database == null || database.isBlank()) {
-            throw new IllegalArgumentException("database cannot be null or blank");
-        }
-        if (mdDatabase == null || mdDatabase.isBlank()) {
-            throw new IllegalArgumentException("mdDatabase cannot be null or blank");
-        }
-        if (toAdd == null) {
-            throw new IllegalArgumentException("toAdd cannot be null");
-        }
-        if (toRemove == null) {
-            throw new IllegalArgumentException("toRemove cannot be null");
-        }
-
-        // Early return if nothing to do
-        if (toAdd.isEmpty() && toRemove.isEmpty()) {
-            return -1;
-        }
+        if (database == null || database.isBlank()) throw new IllegalArgumentException("database cannot be null or blank");
+        if (mdDatabase == null || mdDatabase.isBlank()) throw new IllegalArgumentException("mdDatabase cannot be null or blank");
+        if (toAdd == null) throw new IllegalArgumentException("toAdd cannot be null");
+        if (toRemove == null) throw new IllegalArgumentException("toRemove cannot be null");
+        if (toAdd.isEmpty() && toRemove.isEmpty()) return -1;
 
         try (Connection conn = ConnectionPool.getConnection()) {
-            String tableName = ConnectionPool.collectFirst(conn, getTableNameById(mdDatabase, tableId), String.class);
+            String tableName = ConnectionPool.collectFirst(conn, tableNameByIdQuery(mdDatabase, tableId), String.class);
             if (tableName == null) {
                 throw new IllegalStateException("Table not found for tableId=" + tableId);
             }
 
             String tempTableName = null;
             Long tempTableId = null;
-
-            // Phase 1: Add files to a temp table (ducklake_add_data_files auto-commits,
-            // but only affects the temp table — main table is untouched)
-            if (!toAdd.isEmpty()) {
-                tempTableName = "__temp_" + tableId;
-
-                // Create temp table with same schema as main table
-                ConnectionPool.execute(conn, "CREATE OR REPLACE TABLE %s.%s AS SELECT * FROM %s.%s LIMIT 0"
-                        .formatted(database, tempTableName, database, tableName));
-                tempTableId = ConnectionPool.collectFirst(conn, getTableIdSql(mdDatabase, tempTableName), Long.class);
-
-                // Get existing active file paths to avoid duplicates on retry
-                var existingFilesIterator = ConnectionPool.collectFirstColumn(conn,
-                        getExistingActiveFilesQuery(mdDatabase, tableId),
-                        String.class).iterator();
-                List<String> existingFileNames = new ArrayList<>();
-                while (existingFilesIterator.hasNext()) {
-                    existingFileNames.add(extractFileName(existingFilesIterator.next()));
-                }
-
-                for (String file : toAdd) {
-                    String fileName = extractFileName(file);
-                    if (!existingFileNames.contains(fileName)) {
-                        String escapedFile = escapeSql(file);
-                        ConnectionPool.execute(conn, ADD_FILE_TO_TABLE_QUERY.formatted(database, tempTableName, escapedFile));
-                    }
-                }
-            }
-
-            // Phase 2: Single transaction — create snapshot, move files, mark deletions
-            conn.setAutoCommit(false);
             try {
-                long snapshotId = createNewSnapshot(conn, mdDatabase);
-
-                // Mark files for deletion
-                if (!toRemove.isEmpty()) {
-                    String filePaths = toQuotedSqlList(toRemove);
-                    List<Long> fileIds = collectLongList(conn, getFileIdByPathQuery(mdDatabase, tableId, filePaths));
-
-                    if (fileIds.size() != toRemove.size()) {
-                        throw new IllegalStateException("One or more files scheduled for deletion were not found for tableId=" + tableId);
-                    }
-
-                    markFilesAsDeleted(conn, mdDatabase, snapshotId, fileIds);
+                // Phase 1: register new files under a temp table (auto-commits to temp table only).
+                if (!toAdd.isEmpty()) {
+                    tempTableName = "__temp_" + tableId + "_" + UUID.randomUUID().toString().replace("-", "");
+                    tempTableId = addFilesToTempTable(conn, database, mdDatabase, tableName, tableId, tempTableName, toAdd);
                 }
 
-                // Move files from temp table to main table in metadata
-                if (tempTableId != null) {
-                    ConnectionPool.execute(conn, moveFilesToMainTableQuery(mdDatabase, tableId, tempTableId, snapshotId));
-                }
+                // Phase 2: atomically create snapshot, move temp files to main table, retire old files.
+                return MetadataConfig.isPostgres()
+                        ? commitViaPostgres(tableId, tempTableId, toRemove)
+                        : commitViaDuckDb(conn, mdDatabase, tableId, tempTableId, toRemove);
 
-                conn.commit();
-
-                // Cleanup: drop temp table (outside transaction, best-effort)
+            } finally {
+                // Always drop temp table, whether Phase 2 committed or rolled back.
                 if (tempTableName != null) {
-                    conn.setAutoCommit(true);
                     try {
                         ConnectionPool.execute(conn, "DROP TABLE IF EXISTS %s.%s".formatted(database, tempTableName));
-                    } catch (Exception cleanupEx) {
-                        logger.warn("Failed to drop temp table {}.{}: {}", database, tempTableName, cleanupEx.getMessage());
+                    } catch (Exception e) {
+                        logger.warn("Failed to drop temp table {}.{}: {}", database, tempTableName, e.getMessage());
                     }
                 }
-                return snapshotId;
-            } catch (Exception e) {
-                try {
-                    conn.rollback();
-                } catch (SQLException rollbackEx) {
-                    e.addSuppressed(rollbackEx);
-                }
-                if (e instanceof SQLException) throw (SQLException) e;
-                throw (RuntimeException) e;
-            } finally {
-                conn.setAutoCommit(true);
             }
         }
     }
 
     /**
+     * Rewrites a set of Parquet files into a new layout, optionally repartitioning.
+     * Does not update DuckLake metadata — pair with {@link #replace} to commit.
      *
-     * @param inputFiles input files. Partitioned or un-partitioned.
-     * @param partition
-     * @return the list of newly created files. Note this will not update the metadata. It needs to be combined with replace function to make this changes visible to the table.
-     * <p>
-     * input -> /data/log/a, /data/log/b
-     * baseLocation -> /data/log
-     * partition -> List.Of('date', applicationid).
+     * @param inputFiles   source Parquet file paths
+     * @param baseLocation destination directory (or file path when {@code partition} is empty)
+     * @param partition    columns to partition by; empty list means no partitioning
+     * @return absolute paths of the newly written files
      */
     public static List<String> rewriteWithPartitionNoCommit(List<String> inputFiles,
                                                             String baseLocation,
                                                             List<String> partition) throws SQLException {
-        if (inputFiles == null || inputFiles.isEmpty()) {
-            throw new IllegalArgumentException("inputFiles cannot be null or empty");
-        }
-        if (baseLocation == null || baseLocation.isBlank()) {
-            throw new IllegalArgumentException("baseLocation cannot be null or blank");
-        }
-        if (partition == null) {
-            throw new IllegalArgumentException("partition cannot be null");
-        }
+        if (inputFiles == null || inputFiles.isEmpty()) throw new IllegalArgumentException("inputFiles cannot be null or empty");
+        if (baseLocation == null || baseLocation.isBlank()) throw new IllegalArgumentException("baseLocation cannot be null or blank");
+        if (partition == null) throw new IllegalArgumentException("partition cannot be null");
         try (Connection conn = ConnectionPool.getConnection()) {
             String sources = inputFiles.stream().map(s -> "'" + s + "'").collect(Collectors.joining(","));
-            return getStrings(sources, baseLocation, partition, conn);
+            return executeCopyAndCollectPaths(sources, baseLocation, partition, conn);
         }
     }
 
     /**
-     *
-     * @param inputFile input file..
-     * @param partition
-     * @return the list of newly created files. Note this will not update the metadata. It needs to be combined with replace function to make this changes visible to the table.
-     * <p>
-     * input -> /data/log/a, /data/log/b
-     * baseLocation -> /data/log
-     * partition -> List.Of('date', applicationid).
+     * Single-file overload of {@link #rewriteWithPartitionNoCommit(List, String, List)}.
      */
     public static List<String> rewriteWithPartitionNoCommit(String inputFile,
                                                             String baseLocation,
                                                             List<String> partition) throws SQLException {
-        if (inputFile == null || inputFile.isBlank()) {
-            throw new IllegalArgumentException("inputFile cannot be null or blank");
-        }
-        if (baseLocation == null || baseLocation.isBlank()) {
-            throw new IllegalArgumentException("baseLocation cannot be null or blank");
-        }
-        if (partition == null) {
-            throw new IllegalArgumentException("partition cannot be null");
-        }
+        if (inputFile == null || inputFile.isBlank()) throw new IllegalArgumentException("inputFile cannot be null or blank");
+        if (baseLocation == null || baseLocation.isBlank()) throw new IllegalArgumentException("baseLocation cannot be null or blank");
+        if (partition == null) throw new IllegalArgumentException("partition cannot be null");
         try (Connection conn = ConnectionPool.getConnection()) {
-            Path p = Paths.get(inputFile);
-            Path fileName = p.getFileName();
-            var targetPath = baseLocation + fileName.toString();
-            return getStrings("'" + inputFile + "'", targetPath, partition, conn);
+            String targetPath = baseLocation + Paths.get(inputFile).getFileName();
+            return executeCopyAndCollectPaths("'" + inputFile + "'", targetPath, partition, conn);
         }
-    }
-
-    private static List<String> getStrings(String inputFile, String baseLocation, List<String> partition, Connection conn) {
-        // Remove trailing slashes to prevent double slashes in partition paths
-        while (baseLocation.endsWith("/")) {
-            baseLocation = baseLocation.substring(0, baseLocation.length() - 1);
-        }
-        String partitionClause = partition.isEmpty() ? "" : "PARTITION_BY (" + String.join(", ", partition) + "),";
-        String copyQuery = COPY_TO_NEW_FILE_WITH_PARTITION_QUERY.formatted(inputFile, baseLocation, partitionClause);
-
-        List<String> files = new ArrayList<>();
-        for (CopyResult r : ConnectionPool.collectAll(conn, copyQuery, CopyResult.class)) {
-            files.addAll(Arrays.stream(r.files()).map(Object::toString).toList());
-        }
-        return files;
     }
 
     /**
-     * Marks files matching the filter for deletion by setting their end_snapshot directly in metadata.
-     * This follows DuckLake's proper snapshot mechanism - files are not immediately deleted
-     * but marked with an end_snapshot. After calling ducklake_expire_snapshots(), the files
-     * will be moved to ducklake_files_scheduled_for_deletion.
+     * Marks files matching a partition filter for deletion by setting {@code end_snapshot}.
+     * Files are not physically removed until {@code ducklake_expire_snapshots()} is called.
      *
-     * <p>Note: This method uses partition pruning to find files, which only works with files
-     * that have partition directory structure in their paths (e.g., "category=sales/data_0.parquet").
-     * Files created by normal INSERT statements may not have this structure.
+     * <p>Only files with Hive-style partition directory structure (e.g.
+     * {@code category=sales/data_0.parquet}) can be matched by the filter.
      *
-     * @param tableId    the table ID whose files should be marked for deletion
+     * @param tableId    the table whose files should be retired
      * @param mdDatabase metadata database name
-     * @param filter     SQL SELECT statement with WHERE clause to identify files to delete.
-     *                   Files matching this filter (based on partition pruning) will be marked for deletion.
-     * @return List of the file paths which are marked for deletion.
-     * @throws SQLException             if a database access error occurs
+     * @param filter     SQL SELECT with WHERE clause identifying partitions to delete
+     * @return file paths that were retired
+     * @throws SQLException             on database access errors
      * @throws JsonProcessingException  if the filter SQL cannot be parsed
      * @throws IllegalArgumentException if filter or mdDatabase is null or blank
      */
-    public static List<String> deleteDirectlyFromMetadata(long tableId, String mdDatabase, String filter) throws SQLException, JsonProcessingException {
-        if (mdDatabase == null || mdDatabase.isBlank()) {
-            throw new IllegalArgumentException("mdDatabase cannot be null or blank");
-        }
-        if (filter == null || filter.isBlank()) {
-            throw new IllegalArgumentException("filter cannot be null or blank");
-        }
+    public static List<String> deleteDirectlyFromMetadata(long tableId, String mdDatabase, String filter)
+            throws SQLException, JsonProcessingException {
+        if (mdDatabase == null || mdDatabase.isBlank()) throw new IllegalArgumentException("mdDatabase cannot be null or blank");
+        if (filter == null || filter.isBlank()) throw new IllegalArgumentException("filter cannot be null or blank");
 
         try (Connection conn = ConnectionPool.getConnection()) {
-            // Get table schema and name for partition pruning
-            var tableInfoIterator = ConnectionPool.collectAll(conn,
-                    getTableInfoByIdQuery(mdDatabase, tableId), TableInfo.class).iterator();
+            var tableInfoIterator = ConnectionPool.collectAll(conn, tableInfoByIdQuery(mdDatabase, tableId), TableInfo.class).iterator();
             if (!tableInfoIterator.hasNext()) {
                 throw new IllegalStateException("Table not found for tableId=" + tableId);
             }
             TableInfo tableInfo = tableInfoIterator.next();
 
-            // Use DucklakePartitionPruning to get files matching the filter (files to delete)
             DucklakePartitionPruning pruning = new DucklakePartitionPruning(mdDatabase);
-            List<FileStatus> filesToDelete = pruning.pruneFiles(tableInfo.schemaName(), tableInfo.tableName(), filter);
-            Set<String> filesToRemove = filesToDelete.stream()
-                    .map(FileStatus::fileName)
-                    .collect(Collectors.toSet());
+            Set<String> filesToRemove = pruning.pruneFiles(tableInfo.schemaName(), tableInfo.tableName(), filter)
+                    .stream().map(FileStatus::fileName).collect(Collectors.toSet());
 
             if (filesToRemove.isEmpty()) {
                 return List.of();
             }
 
-            // Get file IDs for files to remove
-            String filePaths = toQuotedSqlList(new ArrayList<>(filesToRemove));
-            List<Long> fileIds = collectLongList(conn,
-                    getFileIdsByTableAndPathsQuery(mdDatabase, tableId, filePaths));
-
+            List<Long> fileIds = queryLongList(conn,
+                    fileIdsByPathQuery(mdDatabase, tableId, toQuotedSqlList(new ArrayList<>(filesToRemove))));
             if (fileIds.isEmpty()) {
                 return List.of();
             }
 
-            // Create a new snapshot and mark files for deletion
-            long newSnapshotId = createNewSnapshot(conn, mdDatabase);
-            markFilesAsDeleted(conn, mdDatabase, newSnapshotId, fileIds);
-
+            long snapshotId = createNewSnapshot(conn, mdDatabase);
+            markFilesAsDeleted(conn, mdDatabase, snapshotId, fileIds);
             return new ArrayList<>(filesToRemove);
         }
     }
 
+    /**
+     * Lists active data files for a table within a given size range.
+     *
+     * @param mdDatabase metadata database name
+     * @param tableId    table ID
+     * @param minSize    minimum file size in bytes (inclusive)
+     * @param maxSize    maximum file size in bytes (inclusive)
+     * @return matching file statuses
+     */
     public static List<FileStatus> listFiles(String mdDatabase,
                                              long tableId,
                                              long minSize,
                                              long maxSize) throws SQLException {
-        if (mdDatabase == null || mdDatabase.isBlank()) {
-            throw new IllegalArgumentException("mdDatabase cannot be null or blank");
-        }
-        if (minSize < 0) {
-            throw new IllegalArgumentException("minSize cannot be negative");
-        }
-        if (maxSize < minSize) {
-            throw new IllegalArgumentException("maxSize cannot be less than minSize");
-        }
-        List<FileStatus> filesToCompact = new ArrayList<>();
+        if (mdDatabase == null || mdDatabase.isBlank()) throw new IllegalArgumentException("mdDatabase cannot be null or blank");
+        if (minSize < 0) throw new IllegalArgumentException("minSize cannot be negative");
+        if (maxSize < minSize) throw new IllegalArgumentException("maxSize cannot be less than minSize");
         try (Connection conn = ConnectionPool.getConnection()) {
-            for (FileStatus file : ConnectionPool.collectAll(conn, selectDucklakeDataFilesQuery(mdDatabase, tableId, minSize, maxSize), FileStatus.class)) {
-                filesToCompact.add(file);
-            }
+            List<FileStatus> result = new ArrayList<>();
+            ConnectionPool.collectAll(conn, dataFilesInSizeRangeQuery(mdDatabase, tableId, minSize, maxSize), FileStatus.class)
+                    .forEach(result::add);
+            return result;
         }
-        return filesToCompact;
     }
 
     /**
-     * Looks up the table ID for a given table name from DuckLake metadata.
-     *
-     * @param metadataDatabase The metadata database name (e.g., "__ducklake_metadata_<catalog>")
-     * @param tableName        The table name to look up
-     * @return The table ID, or null if not found
+     * Returns the table ID for the given table name, or {@code null} if not found.
      */
     public static Long lookupTableId(String metadataDatabase, String tableName) {
         if (metadataDatabase == null || metadataDatabase.isBlank()) {
@@ -397,27 +328,22 @@ public class MergeTableOpsUtil {
             logger.warn("Cannot lookup table_id: tableName is null or blank");
             return null;
         }
-
         try {
-            Long tableId = ConnectionPool.collectFirst(getTableIdSql(metadataDatabase, escapeSql(tableName)), Long.class);
+            Long tableId = ConnectionPool.collectFirst(tableIdByNameQuery(metadataDatabase, escapeSql(tableName)), Long.class);
             if (tableId == null) {
                 logger.debug("Table '{}' not found in metadata database '{}'", tableName, metadataDatabase);
             }
             return tableId;
         } catch (SQLException e) {
-            logger.error("Failed to lookup table_id for table '{}' in '{}': {}",
-                    tableName, metadataDatabase, e.getMessage());
+            logger.error("Failed to lookup table_id for table '{}' in '{}': {}", tableName, metadataDatabase, e.getMessage());
             return null;
         }
     }
 
     /**
-     * Looks up the table ID for a given table name, throwing an exception if not found.
+     * Returns the table ID for the given table name, throwing if not found.
      *
-     * @param metadataDatabase The metadata database name
-     * @param tableName        The table name to look up
-     * @return The table ID
-     * @throws IllegalStateException if the table is not found
+     * @throws IllegalStateException if the table does not exist
      */
     public static long requireTableId(String metadataDatabase, String tableName) {
         Long tableId = lookupTableId(metadataDatabase, tableName);
@@ -428,62 +354,225 @@ public class MergeTableOpsUtil {
         return tableId;
     }
 
+    // =========================================================================
+    // Phase helpers
+    // =========================================================================
+
     /**
-     * Escapes single quotes in SQL strings.
+     * Phase 1: creates a temp table, then registers each file in {@code toAdd} under it via
+     * {@code ducklake_add_data_files}, skipping files already active in the main table.
+     *
+     * @return the temp-table ID assigned by DuckLake metadata
      */
+    private static long addFilesToTempTable(Connection conn,
+                                            String database,
+                                            String mdDatabase,
+                                            String tableName,
+                                            long tableId,
+                                            String tempTableName,
+                                            List<String> toAdd) throws SQLException {
+        ConnectionPool.execute(conn, "CREATE OR REPLACE TABLE %s.%s AS SELECT * FROM %s.%s LIMIT 0"
+                .formatted(database, tempTableName, database, tableName));
+        long tempTableId = ConnectionPool.collectFirst(conn, tableIdByNameQuery(mdDatabase, tempTableName), Long.class);
+
+        // Skip files already registered in the main table (idempotency on retry).
+        Set<String> existingPaths = new HashSet<>();
+        ConnectionPool.collectFirstColumn(conn, activeFilePathsQuery(mdDatabase, tableId), String.class)
+                .forEach(existingPaths::add);
+
+        for (String file : toAdd) {
+            if (!existingPaths.contains(file)) {
+                ConnectionPool.execute(conn, ADD_FILE_TO_TABLE_QUERY.formatted(database, tempTableName, escapeSql(file)));
+            }
+        }
+        return tempTableId;
+    }
+
+    /**
+     * Phase 2 via direct Postgres JDBC: creates a snapshot with {@code INSERT...RETURNING}
+     * (race-free), retires old files, and moves temp-table files to the main table —
+     * all within a single Postgres transaction.
+     */
+    private static long commitViaPostgres(long tableId, Long tempTableId, List<String> toRemove) throws SQLException {
+        try (Connection pgConn = MetadataConfig.getPostgresConnection()) {
+            pgConn.setAutoCommit(false);
+            try {
+                long snapshotId = createSnapshotViaPostgres(pgConn);
+
+                if (!toRemove.isEmpty()) {
+                    List<Long> fileIds = collectLongListJdbc(pgConn, pgFileIdsByPathQuery(tableId, toQuotedSqlList(toRemove)));
+                    if (fileIds.size() != toRemove.size()) {
+                        throw new IllegalStateException(
+                                "One or more files scheduled for deletion were not found for tableId=" + tableId);
+                    }
+                    executeJdbc(pgConn, pgSetEndSnapshotQuery(snapshotId, joinIds(fileIds)));
+                }
+
+                if (tempTableId != null) {
+                    executeJdbc(pgConn, pgMoveFilesToMainTableQuery(tableId, tempTableId, snapshotId));
+                }
+
+                pgConn.commit();
+                return snapshotId;
+            } catch (SQLException e) {
+                pgConn.rollback();
+                throw e;
+            } catch (RuntimeException e) {
+                pgConn.rollback();
+                throw e;
+            } catch (Exception e) {
+                pgConn.rollback();
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    /**
+     * Phase 2 via DuckDB connection: creates a snapshot using two queries (INSERT then MAX),
+     * retires old files, and moves temp-table files to the main table —
+     * all within a single DuckDB transaction.
+     */
+    private static long commitViaDuckDb(Connection conn,
+                                        String mdDatabase,
+                                        long tableId,
+                                        Long tempTableId,
+                                        List<String> toRemove) throws SQLException {
+        conn.setAutoCommit(false);
+        try {
+            long snapshotId = createNewSnapshot(conn, mdDatabase);
+
+            if (!toRemove.isEmpty()) {
+                List<Long> fileIds = queryLongList(conn, fileIdsByPathQuery(mdDatabase, tableId, toQuotedSqlList(toRemove)));
+                if (fileIds.size() != toRemove.size()) {
+                    throw new IllegalStateException(
+                            "One or more files scheduled for deletion were not found for tableId=" + tableId);
+                }
+                markFilesAsDeleted(conn, mdDatabase, snapshotId, fileIds);
+            }
+
+            if (tempTableId != null) {
+                ConnectionPool.execute(conn, moveFilesToMainTableQuery(mdDatabase, tableId, tempTableId, snapshotId));
+            }
+
+            conn.commit();
+            return snapshotId;
+        } catch (SQLException e) {
+            conn.rollback();
+            throw e;
+        } catch (RuntimeException e) {
+            conn.rollback();
+            throw e;
+        } catch (Exception e) {
+            conn.rollback();
+            throw new RuntimeException(e);
+        } finally {
+            conn.setAutoCommit(true);
+        }
+    }
+
+    // =========================================================================
+    // Snapshot helpers
+    // =========================================================================
+
+    /** Creates a snapshot via DuckDB and returns its ID (two queries: INSERT then MAX). */
+    private static long createNewSnapshot(Connection conn, String mdDatabase) throws SQLException {
+        ConnectionPool.execute(conn, createSnapshotQuery(mdDatabase));
+        return ConnectionPool.collectFirst(conn, maxSnapshotIdQuery(mdDatabase), Long.class);
+    }
+
+    /**
+     * Creates a snapshot via a direct Postgres JDBC connection using {@code INSERT...RETURNING},
+     * atomically returning the new snapshot ID without a race condition.
+     */
+    private static long createSnapshotViaPostgres(Connection pgConn) throws SQLException {
+        try (Statement stmt = pgConn.createStatement();
+             ResultSet rs = stmt.executeQuery(pgCreateSnapshotQuery())) {
+            if (!rs.next()) {
+                throw new SQLException("INSERT...RETURNING returned no rows for snapshot creation");
+            }
+            return rs.getLong(1);
+        }
+    }
+
+    // =========================================================================
+    // JDBC / query utilities
+    // =========================================================================
+
+    private static void markFilesAsDeleted(Connection conn, String mdDatabase, long snapshotId, List<Long> fileIds)
+            throws SQLException {
+        ConnectionPool.execute(conn, setEndSnapshotQuery(mdDatabase, snapshotId, joinIds(fileIds)));
+    }
+
+    /** Runs a DuckDB-connection query and collects the first column as {@code Long} values. */
+    private static List<Long> queryLongList(Connection conn, String query) throws SQLException {
+        List<Long> result = new ArrayList<>();
+        ConnectionPool.collectFirstColumn(conn, query, Long.class).forEach(result::add);
+        return result;
+    }
+
+    /** Executes a SQL statement on a plain JDBC connection (bypassing {@code ConnectionPool}). */
+    private static void executeJdbc(Connection conn, String sql) throws SQLException {
+        try (Statement stmt = conn.createStatement()) {
+            stmt.execute(sql);
+        }
+    }
+
+    /** Runs a query on a plain JDBC connection and collects the first column as {@code Long} values. */
+    private static List<Long> collectLongListJdbc(Connection conn, String sql) throws SQLException {
+        List<Long> result = new ArrayList<>();
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            while (rs.next()) {
+                result.add(rs.getLong(1));
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Runs a DuckDB COPY query and returns the written file paths reported by {@code RETURN_FILES}.
+     */
+    private static List<String> executeCopyAndCollectPaths(String sources,
+                                                           String baseLocation,
+                                                           List<String> partition,
+                                                           Connection conn) {
+        while (baseLocation.endsWith("/")) {
+            baseLocation = baseLocation.substring(0, baseLocation.length() - 1);
+        }
+        String partitionClause = partition.isEmpty() ? "" : "PARTITION_BY (" + String.join(", ", partition) + "),";
+        String copyQuery = COPY_WITH_PARTITION_QUERY.formatted(sources, baseLocation, partitionClause);
+
+        List<String> files = new ArrayList<>();
+        for (CopyResult r : ConnectionPool.collectAll(conn, copyQuery, CopyResult.class)) {
+            files.addAll(Arrays.stream(r.files()).map(Object::toString).toList());
+        }
+        return files;
+    }
+
+    // =========================================================================
+    // SQL string utilities
+    // =========================================================================
+
+    /** Escapes single quotes in a SQL string value. */
     private static String escapeSql(String value) {
         return value.replace("'", "''");
     }
 
-    /**
-     * Converts a list of strings to a quoted SQL list (e.g., "'val1','val2'").
-     * Single quotes in values are escaped to prevent SQL injection.
-     */
+    /** Converts a list of strings to a quoted, comma-separated SQL list (e.g. {@code 'a','b'}). */
     private static String toQuotedSqlList(List<String> values) {
         return values.stream()
                 .map(v -> "'" + v.replace("'", "''") + "'")
                 .collect(Collectors.joining(", "));
     }
 
-    /**
-     * Extracts the filename from a file path.
-     * Handles both paths with '/' separators and plain filenames.
-     */
-    private static String extractFileName(String path) {
-        int lastSlash = path.lastIndexOf('/');
-        return lastSlash >= 0 ? path.substring(lastSlash + 1) : path;
+    /** Joins a list of Long IDs into a comma-separated string for use in SQL {@code IN} clauses. */
+    private static String joinIds(List<Long> ids) {
+        return ids.stream().map(String::valueOf).collect(Collectors.joining(", "));
     }
 
-    /**
-     * Collects a list of Long values from a SQL query.
-     */
-    private static List<Long> collectLongList(Connection conn, String query) throws SQLException {
-        var iterator = ConnectionPool.collectFirstColumn(conn, query, Long.class).iterator();
-        List<Long> result = new ArrayList<>();
-        while (iterator.hasNext()) {
-            result.add(iterator.next());
-        }
-        return result;
-    }
+    // =========================================================================
+    // Types
+    // =========================================================================
 
-    /**
-     * Creates a new DuckLake snapshot and returns its ID.
-     */
-    private static long createNewSnapshot(Connection conn, String mdDatabase) throws SQLException {
-        ConnectionPool.execute(conn, createSnapshotQuery(mdDatabase));
-        return ConnectionPool.collectFirst(conn, getMaxSnapshotIdQuery(mdDatabase), Long.class);
-    }
-
-    private static void markFilesAsDeleted(Connection conn, String mdDatabase, long snapshotId, List<Long> fileIds) throws SQLException {
-        String fileIdsString = fileIds.stream()
-                .map(String::valueOf)
-                .collect(Collectors.joining(", "));
-        ConnectionPool.execute(conn, setEndSnapshotQuery(mdDatabase, snapshotId, fileIdsString));
-    }
-
-    /**
-     * Record to hold table schema and name information.
-     */
-    public record TableInfo(String schemaName, String tableName) {
-    }
+    public record TableInfo(String schemaName, String tableName) {}
 }

@@ -119,6 +119,9 @@ public class MergeTableOpsUtilPostgresMinIOTest {
                         BUCKET_NAME
                 );
         ConnectionPool.execute(attach);
+
+        MetadataConfig.initPostgres(postgres.getHost(), postgres.getFirstMappedPort(),
+                postgres.getDatabaseName(), postgres.getUsername(), postgres.getPassword());
     }
 
     @AfterEach
@@ -127,6 +130,7 @@ public class MergeTableOpsUtilPostgresMinIOTest {
             ConnectionPool.execute("DETACH " + catalog);
         } catch (Exception ignored) {
         }
+        MetadataConfig.reset();
         cleanupS3Bucket();
     }
 

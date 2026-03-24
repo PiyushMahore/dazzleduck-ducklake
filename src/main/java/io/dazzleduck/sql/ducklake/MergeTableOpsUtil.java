@@ -350,7 +350,7 @@ public class MergeTableOpsUtil {
             }
             TableInfo tableInfo = tableInfoIterator.next();
 
-            DucklakePartitionPruning pruning = new DucklakePartitionPruning(mdDatabase);
+            DucklakePartitionPruning pruning = new DucklakePartitionPruning(mdDatabase, MetadataConfig.q());
             Set<String> filesToRemove = pruning.pruneFiles(tableInfo.schemaName(), tableInfo.tableName(), filter)
                     .stream().map(FileStatus::fileName).collect(Collectors.toSet());
 
